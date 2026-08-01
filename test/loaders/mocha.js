@@ -1,4 +1,4 @@
-/* eslint-env mocha */
+/* global describe, before, it */
 import assert from 'assert'
 import teddy from '../../teddy.js'
 import { loadTests } from './loadTests.js'

@@ -14,7 +14,14 @@ jobs:
         with:
           node-version: ${{ matrix.node-version }}
       - run: npm ci
-      - run: npx playwright install
+      # --with-deps is Linux-only: on Windows it triggers a PowerShell Media
+      # Pack install, and on macOS it does nothing
+      - name: Install Playwright browsers and system dependencies
+        if: runner.os == 'Linux'
+        run: npx playwright install --with-deps
+      - name: Install Playwright browsers
+        if: runner.os != 'Linux'
+        run: npx playwright install
       - run: npm run build
       - run: npm run lint
       - run: npm t
