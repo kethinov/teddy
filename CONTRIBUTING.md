@@ -1,5 +1,14 @@
 # How to contribute
 
+## Setting up your development environment
+
+- Install dependencies: `npm ci`.
+- Install the browsers the client-side tests run against: `npx playwright install`.
+
+The client-side test suite runs against Chromium, Firefox, and WebKit.
+
+On Linux, WebKit needs some system libraries that may not be present. If a browser fails to launch, Playwright will name the packages it needs; on Debian and Ubuntu, `sudo npx playwright install-deps` installs them for you.
+
 ## Before opening a pull request
 
 - Be sure all tests pass: `npm t`.
