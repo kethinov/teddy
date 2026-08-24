@@ -307,11 +307,27 @@ export default [
         expected: '<p class="something-is-value">One line if.</p>'
       },
       {
-        message: 'should reduce multiple one line if statements down to only the first one (conditionals/oneLineMulti.html)',
+        message: 'should evaluate every one line if in a sequence of them (conditionals/oneLineMulti.html)',
         template: 'conditionals/oneLineMulti',
         run: async (teddy, template, model, assert, expected) => assert(teddy.render(template, model), expected),
-        expected: '<p class="something-is-present">One line if.</p>',
-        skip: true // TODO: this test is wrong. the behavior differs in cheerio vs vanilla. both behaviors are arguably wrong. in cheerio it removes the second one line if. in vanilla it removes the first one. the correct behavior would be to parse both
+        // the middle conditional in that template is `if-something=''`, which asks whether something is the empty string
+        // an empty value cannot be told apart from no value at all, so it reads as a plain truthiness check, and since it supplies only a false outcome it contributes nothing here
+        // the two spellings differ only in how each parser writes an attribute that has no value
+        expected: ['<p class="something-is-present" data-should-render>One line if.</p>', '<p class="something-is-present" data-should-render="">One line if.</p>']
+      },
+      {
+        message: 'should apply the outcome of each one line if in a sequence (conditionals/oneLineSequence.html)',
+        template: 'conditionals/oneLineSequence',
+        run: async (teddy, template, model, assert, expected) => assert(teddy.render(template, model), expected),
+        expected: ['<p class="first" data-second="yes">One line if.</p>']
+      },
+      {
+        message: 'should treat a one line if that begins another condition before giving an outcome as one condition',
+        run: async (teddy, template, model, assert, expected) => {
+          // there is nothing joining the two conditions and no outcome was given for the first, so they read as a single condition rather than as a sequence; teddy warns about it when its verbosity allows
+          assert(teddy.render('<p if-something if-nonexistent true=\'class="both"\' false=\'class="notboth"\'>x</p>', model), expected)
+        },
+        expected: '<p class="notboth">x</p>'
       },
       {
         message: 'should evaluate one line if "if-something" with a dynamic value (conditionals/oneLineDynamicVariable.html)',
@@ -676,6 +692,13 @@ export default [
         expected: '<p>0</p><p>a</p><p>b</p><p>c</p><p>1</p><p>d</p><p>e</p><p>f</p><p>2</p><p>g</p><p>h</p><p>i</p>'
       },
       {
+        // an iteration whose body needs no teddy parsing skips being loaded into a dom of its own, so this checks that the markup those iterations produce is still tidied up the way it always was
+        message: 'should tidy up malformed markup coming from the model in a loop (looping/loopWithRawMarkup.html)',
+        template: 'looping/loopWithRawMarkup',
+        run: async (teddy, template, model, assert, expected) => assert(teddy.render(template, model), expected),
+        expected: '<div><em>fine</em></div><div><p>unclosed</p></div><div><b><i>crossed</i></b></div>'
+      },
+      {
         message: 'should loop through {objects} correctly (looping/loopArrayOfObjects.html)',
         template: 'looping/loopArrayOfObjects',
         run: async (teddy, template, model, assert, expected) => assert(teddy.render(template, model), expected),
@@ -773,12 +796,12 @@ export default [
           teddy.render(template, model)
           const end = new Date().getTime()
           const time = end - start
-          console.log('    → Non-cached time to parse: ', time)
+          if (typeof process === 'object' && process.env.TEDDY_TEST_TIMINGS) console.log('    → Non-cached time to parse: ', time)
           const start2 = new Date().getTime()
           teddy.render(template, model)
           const end2 = new Date().getTime()
           const time2 = end2 - start2
-          console.log('    → Cached time to parse:     ', time2)
+          if (typeof process === 'object' && process.env.TEDDY_TEST_TIMINGS) console.log('    → Cached time to parse:     ', time2)
           const lessThan = time2 < time || time2 > time || time2 === time // this is necessary because CI CPU cycles vary so there's no way to guarantee the result
           return lessThan
         },
@@ -1293,31 +1316,41 @@ export default [
             return new Promise(resolve => setTimeout(resolve, ms))
           }
 
+          // whether a render came from the cache is judged by what it contains rather than by how long it took: the data is edited between renders, so a render still showing the old data was served from the cache and one showing the edit was not
+          //
+          // the data set is copied first, so editing it cannot reach the model the rest of the suite shares, and it is copied at full size, so the timings below still describe a realistic render
+          const rows = model.largeDataSet.map(row => ({ ...row }))
+          const localModel = Object.assign({}, model, { largeDataSet: rows })
+
           teddy.setCache({
             template,
             key: null,
             maxAge: 1000
           })
           const start1 = new Date().getTime()
-          teddy.render(template, model)
+          const first = teddy.render(template, localModel)
           const end1 = new Date().getTime()
           const time1 = end1 - start1
-          console.log('    → Non-cached time to parse: ', time1)
+          if (typeof process === 'object' && process.env.TEDDY_TEST_TIMINGS) console.log('    → Non-cached time to parse: ', time1)
 
+          rows[0].one = 'firstEdit'
           const start2 = new Date().getTime()
-          teddy.render(template, model)
+          const cached = teddy.render(template, localModel)
           const end2 = new Date().getTime()
           const time2 = end2 - start2
-          console.log('    → Cached time to parse:     ', time2)
+          if (typeof process === 'object' && process.env.TEDDY_TEST_TIMINGS) console.log('    → Cached time to parse:     ', time2)
 
           await timeout(1100)
+          rows[0].one = 'secondEdit'
           const start3 = new Date().getTime()
-          teddy.render(template, model)
+          const afterExpiry = teddy.render(template, localModel)
           const end3 = new Date().getTime()
           const time3 = end3 - start3
-          console.log('    → Non-cached time to parse after clearing cache: ', time3)
-          const fasterSlower = time2 < 100 && time3 > 100
-          assert(fasterSlower)
+          if (typeof process === 'object' && process.env.TEDDY_TEST_TIMINGS) console.log('    → Non-cached time to parse after clearing cache: ', time3)
+
+          const servedFromCache = cached === first && !cached.includes('firstEdit')
+          const renderedAgainOnceExpired = afterExpiry.includes('secondEdit')
+          assert(servedFromCache && renderedAgainOnceExpired)
         },
         expected: ''
       },
@@ -1325,34 +1358,44 @@ export default [
         message: 'should render template, then render cached template, then render the template again when the cache is explicitly cleared (misc/cacheWholeTemplate.html)',
         template: 'misc/cacheWholeTemplate',
         run: async (teddy, template, model, assert, expected) => {
+          // whether a render came from the cache is judged by what it contains rather than by how long it took: the data is edited between renders, so a render still showing the old data was served from the cache and one showing the edit was not
+          //
+          // the data set is copied first, so editing it cannot reach the model the rest of the suite shares, and it is copied at full size, so the timings below still describe a realistic render
+          const rows = model.largeDataSet.map(row => ({ ...row }))
+          const localModel = Object.assign({}, model, { largeDataSet: rows })
+
           teddy.setCache({
             template,
             key: null,
             maxAge: 1000
           })
           const start1 = new Date().getTime()
-          teddy.render(template, model)
+          const first = teddy.render(template, localModel)
           const end1 = new Date().getTime()
           const time1 = end1 - start1
-          console.log('    → Non-cached time to parse: ', time1)
+          if (typeof process === 'object' && process.env.TEDDY_TEST_TIMINGS) console.log('    → Non-cached time to parse: ', time1)
 
+          rows[0].one = 'firstEdit'
           const start2 = new Date().getTime()
-          teddy.render(template, model)
+          const cached = teddy.render(template, localModel)
           const end2 = new Date().getTime()
           const time2 = end2 - start2
-          console.log('    → Cached time to parse:     ', time2)
+          if (typeof process === 'object' && process.env.TEDDY_TEST_TIMINGS) console.log('    → Cached time to parse:     ', time2)
           teddy.clearCache({
             template,
             key: null
           })
 
+          rows[0].one = 'secondEdit'
           const start3 = new Date().getTime()
-          teddy.render(template, model)
+          const afterClearing = teddy.render(template, localModel)
           const end3 = new Date().getTime()
           const time3 = end3 - start3
-          console.log('    → Non-cached time to parse after clearing cache: ', time3)
-          const fasterSlower = time2 < 100 && time3 > 100
-          assert(fasterSlower)
+          if (typeof process === 'object' && process.env.TEDDY_TEST_TIMINGS) console.log('    → Non-cached time to parse after clearing cache: ', time3)
+
+          const servedFromCache = cached === first && !cached.includes('firstEdit')
+          const renderedAgainOnceCleared = afterClearing.includes('secondEdit')
+          assert(servedFromCache && renderedAgainOnceCleared)
         },
         expected: ''
       },
@@ -1364,39 +1407,48 @@ export default [
             return new Promise(resolve => setTimeout(resolve, ms))
           }
 
-          const modelNY = Object.assign({ city: 'NY' }, model)
-          const modelSF = Object.assign({ city: 'SF' }, model)
+          // whether a render came from the cache is judged by what it contains rather than by how long it took: the data is edited between renders, so a render still showing the old data was served from the cache and one showing the edit was not
+          //
+          // the data set is copied first, so editing it cannot reach the model the rest of the suite shares, and it is copied at full size, so the timings below still describe a realistic render
+          const rows = model.largeDataSet.map(row => ({ ...row }))
+          const modelNY = Object.assign({ city: 'NY' }, model, { largeDataSet: rows })
+          const modelSF = Object.assign({ city: 'SF' }, model, { largeDataSet: rows })
           teddy.setCache({
             template,
             key: 'city',
             maxAge: 1000
           })
           const start1 = new Date().getTime()
-          teddy.render(template, modelNY)
+          const firstNY = teddy.render(template, modelNY)
           const end1 = new Date().getTime()
           const time1 = end1 - start1
-          console.log('    → Non-cached time to parse (NY): ', time1)
+          if (typeof process === 'object' && process.env.TEDDY_TEST_TIMINGS) console.log('    → Non-cached time to parse (NY): ', time1)
 
+          rows[0].one = 'firstEdit'
           const start3 = new Date().getTime()
-          teddy.render(template, modelNY)
+          const cachedNY = teddy.render(template, modelNY)
           const end3 = new Date().getTime()
           const time3 = end3 - start3
-          console.log('    → Cached time to parse (NY):     ', time3)
+          if (typeof process === 'object' && process.env.TEDDY_TEST_TIMINGS) console.log('    → Cached time to parse (NY):     ', time3)
 
           const start2 = new Date().getTime()
-          teddy.render(template, modelSF)
+          const firstSF = teddy.render(template, modelSF)
           const end2 = new Date().getTime()
           const time2 = end2 - start2
-          console.log('    → Non-cached time to parse (SF): ', time2)
+          if (typeof process === 'object' && process.env.TEDDY_TEST_TIMINGS) console.log('    → Non-cached time to parse (SF): ', time2)
 
           await timeout(1100)
+          rows[0].one = 'secondEdit'
           const start4 = new Date().getTime()
-          teddy.render(template, modelSF)
+          const afterCacheWentAway = teddy.render(template, modelSF)
           const end4 = new Date().getTime()
           const time4 = end4 - start4
-          console.log('    → Non-cached time to parse after clearing cache (SF): ', time4)
-          const fasterSlower = time3 < 100 && time4 > 100
-          assert(fasterSlower)
+          if (typeof process === 'object' && process.env.TEDDY_TEST_TIMINGS) console.log('    → Non-cached time to parse after clearing cache (SF): ', time4)
+
+          const servedFromCache = cachedNY === firstNY && !cachedNY.includes('firstEdit')
+          const eachKeyCachedApart = firstSF.includes('firstEdit') // a different value at the key, so nothing cached for it yet
+          const renderedAgainOnceGone = afterCacheWentAway.includes('secondEdit')
+          assert(servedFromCache && eachKeyCachedApart && renderedAgainOnceGone)
         },
         expected: ''
       },
@@ -1404,42 +1456,52 @@ export default [
         message: 'should render template, then render cached template, then render the template again when the cache expires via keyed values when the cache is explicitly cleared (misc/cacheWholeTemplate.html)',
         template: 'misc/cacheWholeTemplate',
         run: async (teddy, template, model, assert, expected) => {
-          const modelNY = Object.assign({ city: 'NY' }, model)
-          const modelSF = Object.assign({ city: 'SF' }, model)
+          // whether a render came from the cache is judged by what it contains rather than by how long it took: the data is edited between renders, so a render still showing the old data was served from the cache and one showing the edit was not
+          //
+          // the data set is copied first, so editing it cannot reach the model the rest of the suite shares, and it is copied at full size, so the timings below still describe a realistic render
+          const rows = model.largeDataSet.map(row => ({ ...row }))
+          const modelNY = Object.assign({ city: 'NY' }, model, { largeDataSet: rows })
+          const modelSF = Object.assign({ city: 'SF' }, model, { largeDataSet: rows })
           teddy.setCache({
             template,
             key: 'city',
             maxAge: 1000
           })
           const start1 = new Date().getTime()
-          teddy.render(template, modelNY)
+          const firstNY = teddy.render(template, modelNY)
           const end1 = new Date().getTime()
           const time1 = end1 - start1
-          console.log('    → Non-cached time to parse (NY): ', time1)
+          if (typeof process === 'object' && process.env.TEDDY_TEST_TIMINGS) console.log('    → Non-cached time to parse (NY): ', time1)
 
+          rows[0].one = 'firstEdit'
           const start3 = new Date().getTime()
-          teddy.render(template, modelNY)
+          const cachedNY = teddy.render(template, modelNY)
           const end3 = new Date().getTime()
           const time3 = end3 - start3
-          console.log('    → Cached time to parse (NY):     ', time3)
+          if (typeof process === 'object' && process.env.TEDDY_TEST_TIMINGS) console.log('    → Cached time to parse (NY):     ', time3)
 
           const start2 = new Date().getTime()
-          teddy.render(template, modelSF)
+          const firstSF = teddy.render(template, modelSF)
           const end2 = new Date().getTime()
           const time2 = end2 - start2
-          console.log('    → Non-cached time to parse (SF): ', time2)
+          if (typeof process === 'object' && process.env.TEDDY_TEST_TIMINGS) console.log('    → Non-cached time to parse (SF): ', time2)
+
           teddy.clearCache({
             template,
             key: 'city'
           })
 
+          rows[0].one = 'secondEdit'
           const start4 = new Date().getTime()
-          teddy.render(template, modelSF)
+          const afterCacheWentAway = teddy.render(template, modelSF)
           const end4 = new Date().getTime()
           const time4 = end4 - start4
-          console.log('    → Non-cached time to parse after clearing cache (SF): ', time4)
-          const fasterSlower = time3 < 100 && time4 > 100
-          assert(fasterSlower)
+          if (typeof process === 'object' && process.env.TEDDY_TEST_TIMINGS) console.log('    → Non-cached time to parse after clearing cache (SF): ', time4)
+
+          const servedFromCache = cachedNY === firstNY && !cachedNY.includes('firstEdit')
+          const eachKeyCachedApart = firstSF.includes('firstEdit') // a different value at the key, so nothing cached for it yet
+          const renderedAgainOnceGone = afterCacheWentAway.includes('secondEdit')
+          assert(servedFromCache && eachKeyCachedApart && renderedAgainOnceGone)
         },
         expected: ''
       },
@@ -1451,39 +1513,48 @@ export default [
             return new Promise(resolve => setTimeout(resolve, ms))
           }
 
-          const modelNY = Object.assign({ city: { acronym: 'NY' } }, model)
-          const modelSF = Object.assign({ city: { acronym: 'SF' } }, model)
+          // whether a render came from the cache is judged by what it contains rather than by how long it took: the data is edited between renders, so a render still showing the old data was served from the cache and one showing the edit was not
+          //
+          // the data set is copied first, so editing it cannot reach the model the rest of the suite shares, and it is copied at full size, so the timings below still describe a realistic render
+          const rows = model.largeDataSet.map(row => ({ ...row }))
+          const modelNY = Object.assign({ city: { acronym: 'NY' } }, model, { largeDataSet: rows })
+          const modelSF = Object.assign({ city: { acronym: 'SF' } }, model, { largeDataSet: rows })
           teddy.setCache({
             template,
             key: 'city.acronym',
             maxAge: 1000
           })
           const start1 = new Date().getTime()
-          teddy.render(template, modelNY)
+          const firstNY = teddy.render(template, modelNY)
           const end1 = new Date().getTime()
           const time1 = end1 - start1
-          console.log('    → Non-cached time to parse (NY): ', time1)
+          if (typeof process === 'object' && process.env.TEDDY_TEST_TIMINGS) console.log('    → Non-cached time to parse (NY): ', time1)
 
+          rows[0].one = 'firstEdit'
           const start3 = new Date().getTime()
-          teddy.render(template, modelNY)
+          const cachedNY = teddy.render(template, modelNY)
           const end3 = new Date().getTime()
           const time3 = end3 - start3
-          console.log('    → Cached time to parse (NY):     ', time3)
+          if (typeof process === 'object' && process.env.TEDDY_TEST_TIMINGS) console.log('    → Cached time to parse (NY):     ', time3)
 
           const start2 = new Date().getTime()
-          teddy.render(template, modelSF)
+          const firstSF = teddy.render(template, modelSF)
           const end2 = new Date().getTime()
           const time2 = end2 - start2
-          console.log('    → Non-cached time to parse (SF): ', time2)
+          if (typeof process === 'object' && process.env.TEDDY_TEST_TIMINGS) console.log('    → Non-cached time to parse (SF): ', time2)
 
           await timeout(1100)
+          rows[0].one = 'secondEdit'
           const start4 = new Date().getTime()
-          teddy.render(template, modelSF)
+          const afterCacheWentAway = teddy.render(template, modelSF)
           const end4 = new Date().getTime()
           const time4 = end4 - start4
-          console.log('    → Non-cached time to parse after clearing cache (SF): ', time4)
-          const fasterSlower = time3 < 100 && time4 > 100
-          assert(fasterSlower)
+          if (typeof process === 'object' && process.env.TEDDY_TEST_TIMINGS) console.log('    → Non-cached time to parse after clearing cache (SF): ', time4)
+
+          const servedFromCache = cachedNY === firstNY && !cachedNY.includes('firstEdit')
+          const eachKeyCachedApart = firstSF.includes('firstEdit') // a different value at the key, so nothing cached for it yet
+          const renderedAgainOnceGone = afterCacheWentAway.includes('secondEdit')
+          assert(servedFromCache && eachKeyCachedApart && renderedAgainOnceGone)
         },
         expected: ''
       },
@@ -1491,42 +1562,52 @@ export default [
         message: 'should render template, then render cached template, then render the template again when the cache expires via keyed values with nesting when the cache is explicitly cleared (misc/cacheWholeTemplate.html)',
         template: 'misc/cacheWholeTemplate',
         run: async (teddy, template, model, assert, expected) => {
-          const modelNY = Object.assign({ city: { acronym: 'NY' } }, model)
-          const modelSF = Object.assign({ city: { acronym: 'SF' } }, model)
+          // whether a render came from the cache is judged by what it contains rather than by how long it took: the data is edited between renders, so a render still showing the old data was served from the cache and one showing the edit was not
+          //
+          // the data set is copied first, so editing it cannot reach the model the rest of the suite shares, and it is copied at full size, so the timings below still describe a realistic render
+          const rows = model.largeDataSet.map(row => ({ ...row }))
+          const modelNY = Object.assign({ city: { acronym: 'NY' } }, model, { largeDataSet: rows })
+          const modelSF = Object.assign({ city: { acronym: 'SF' } }, model, { largeDataSet: rows })
           teddy.setCache({
             template,
             key: 'city.acronym',
             maxAge: 1000
           })
           const start1 = new Date().getTime()
-          teddy.render(template, modelNY)
+          const firstNY = teddy.render(template, modelNY)
           const end1 = new Date().getTime()
           const time1 = end1 - start1
-          console.log('    → Non-cached time to parse (NY): ', time1)
+          if (typeof process === 'object' && process.env.TEDDY_TEST_TIMINGS) console.log('    → Non-cached time to parse (NY): ', time1)
 
+          rows[0].one = 'firstEdit'
           const start3 = new Date().getTime()
-          teddy.render(template, modelNY)
+          const cachedNY = teddy.render(template, modelNY)
           const end3 = new Date().getTime()
           const time3 = end3 - start3
-          console.log('    → Cached time to parse (NY):     ', time3)
+          if (typeof process === 'object' && process.env.TEDDY_TEST_TIMINGS) console.log('    → Cached time to parse (NY):     ', time3)
 
           const start2 = new Date().getTime()
-          teddy.render(template, modelSF)
+          const firstSF = teddy.render(template, modelSF)
           const end2 = new Date().getTime()
           const time2 = end2 - start2
-          console.log('    → Non-cached time to parse (SF): ', time2)
+          if (typeof process === 'object' && process.env.TEDDY_TEST_TIMINGS) console.log('    → Non-cached time to parse (SF): ', time2)
+
           teddy.clearCache({
             template,
             key: 'city.acronym'
           })
 
+          rows[0].one = 'secondEdit'
           const start4 = new Date().getTime()
-          teddy.render(template, modelSF)
+          const afterCacheWentAway = teddy.render(template, modelSF)
           const end4 = new Date().getTime()
           const time4 = end4 - start4
-          console.log('    → Non-cached time to parse after clearing cache (SF): ', time4)
-          const fasterSlower = time3 < 100 && time4 > 100
-          assert(fasterSlower)
+          if (typeof process === 'object' && process.env.TEDDY_TEST_TIMINGS) console.log('    → Non-cached time to parse after clearing cache (SF): ', time4)
+
+          const servedFromCache = cachedNY === firstNY && !cachedNY.includes('firstEdit')
+          const eachKeyCachedApart = firstSF.includes('firstEdit') // a different value at the key, so nothing cached for it yet
+          const renderedAgainOnceGone = afterCacheWentAway.includes('secondEdit')
+          assert(servedFromCache && eachKeyCachedApart && renderedAgainOnceGone)
         },
         expected: ''
       },
@@ -1552,7 +1633,7 @@ export default [
           teddy.render(template, modelNY)
           const end1 = new Date().getTime()
           const time1 = end1 - start1
-          console.log('    → Non-cached time to parse (NY): ', time1)
+          if (typeof process === 'object' && process.env.TEDDY_TEST_TIMINGS) console.log('    → Non-cached time to parse (NY): ', time1)
           present = typeof teddy.templateCaches[template]['city.acronym'].entries.NY === 'object'
           assert(present)
           await timeout(100)
@@ -1561,7 +1642,7 @@ export default [
           teddy.render(template, modelSF)
           const end2 = new Date().getTime()
           const time2 = end2 - start2
-          console.log('    → Non-cached time to parse (SF): ', time2)
+          if (typeof process === 'object' && process.env.TEDDY_TEST_TIMINGS) console.log('    → Non-cached time to parse (SF): ', time2)
           present = typeof teddy.templateCaches[template]['city.acronym'].entries.SF === 'object'
           assert(present)
           await timeout(100)
@@ -1570,7 +1651,7 @@ export default [
           teddy.render(template, modelLA)
           const end3 = new Date().getTime()
           const time3 = end3 - start3
-          console.log('    → Non-cached time to parse (LA): ', time3)
+          if (typeof process === 'object' && process.env.TEDDY_TEST_TIMINGS) console.log('    → Non-cached time to parse (LA): ', time3)
           present = typeof teddy.templateCaches[template]['city.acronym'].entries.LA === 'object'
           assert(present)
 
@@ -1735,6 +1816,140 @@ export default [
       // }
     ]
 
+  },
+  {
+    describe: 'Template caching',
+    tests: [
+      {
+        message: 'should read a template again after it changes, rather than caching it, by default',
+        runMocha: async (teddy, template, model, assert, expected) => {
+          const file = 'test/templates/misc/cacheProbe.html'
+          fs.writeFileSync(file, '<p>before</p>')
+          teddy.clearTemplates()
+          teddy.render(file, {})
+          fs.writeFileSync(file, '<p>after</p>')
+          const second = teddy.render(file, {})
+          fs.rmSync(file)
+          assert(second.includes('after'), true)
+        },
+        expected: ''
+      },
+      {
+        message: 'should keep a template it already read when the cache option is on',
+        runMocha: async (teddy, template, model, assert, expected) => {
+          const file = 'test/templates/misc/cacheProbeOn.html'
+          fs.writeFileSync(file, '<p>before</p>')
+          teddy.clearTemplates()
+          teddy.render(file, { cache: true })
+          fs.writeFileSync(file, '<p>after</p>')
+          const second = teddy.render(file, { cache: true })
+          fs.rmSync(file)
+          teddy.setCacheTemplates(false) // not setDefaultParams, which would also reset the template root the other tests rely on
+          assert(second.includes('before'), true)
+        },
+        expected: ''
+      },
+      {
+        message: "should take caching from express's view cache setting when no cache option is given",
+        runMocha: async (teddy, template, model, assert, expected) => {
+          const file = 'test/templates/misc/cacheProbeExpress.html'
+          fs.writeFileSync(file, '<p>before</p>')
+          teddy.clearTemplates()
+          teddy.render(file, { settings: { 'view cache': true } })
+          fs.writeFileSync(file, '<p>after</p>')
+          const cached = teddy.render(file, { settings: { 'view cache': true } })
+
+          teddy.clearTemplates()
+          teddy.render(file, { settings: { 'view cache': false } })
+          fs.writeFileSync(file, '<p>later still</p>')
+          const fresh = teddy.render(file, { settings: { 'view cache': false } })
+
+          fs.rmSync(file)
+          teddy.setCacheTemplates(false) // not setDefaultParams, which would also reset the template root the other tests rely on
+          assert(cached.includes('before') && fresh.includes('later still'), true)
+        },
+        expected: ''
+      },
+      {
+        message: 'should let an explicit cache option override the view cache setting',
+        runMocha: async (teddy, template, model, assert, expected) => {
+          const file = 'test/templates/misc/cacheProbeOverride.html'
+          fs.writeFileSync(file, '<p>before</p>')
+          teddy.clearTemplates()
+          teddy.render(file, { cache: false, settings: { 'view cache': true } })
+          fs.writeFileSync(file, '<p>after</p>')
+          const second = teddy.render(file, { cache: false, settings: { 'view cache': true } })
+          fs.rmSync(file)
+          teddy.setCacheTemplates(false) // not setDefaultParams, which would also reset the template root the other tests rely on
+          assert(second.includes('after'), true)
+        },
+        expected: ''
+      },
+      {
+        message: 'should read an included template again after it changes',
+        runMocha: async (teddy, template, model, assert, expected) => {
+          const partial = 'test/templates/misc/cachePartial.html'
+          const page = 'test/templates/misc/cachePage.html'
+          fs.writeFileSync(partial, '<span>before</span>')
+          fs.writeFileSync(page, '<div><include src="misc/cachePartial"></include></div>')
+          teddy.clearTemplates()
+          teddy.render(page, {})
+          fs.writeFileSync(partial, '<span>after</span>')
+          const second = teddy.render(page, {})
+          fs.rmSync(partial)
+          fs.rmSync(page)
+          assert(second.includes('after'), true)
+        },
+        expected: ''
+      },
+      {
+        message: 'should prefer a template registered with setTemplate over a file of the same name',
+        runMocha: async (teddy, template, model, assert, expected) => {
+          const file = 'test/templates/misc/cacheRegistered.html'
+          fs.writeFileSync(file, '<p>from the filesystem</p>')
+          teddy.clearTemplates()
+          teddy.setTemplate('misc/cacheRegistered', '<p>from setTemplate</p>')
+          const rendered = teddy.render('misc/cacheRegistered', {})
+          fs.rmSync(file)
+          teddy.clearTemplates()
+          assert(rendered.includes('from setTemplate'), true)
+        },
+        expected: ''
+      }
+    ]
+  },
+  {
+    describe: 'Public API',
+    tests: [
+      {
+        message: 'should render an include whose src cannot be found as nothing when includeNotFoundBehavior is hide',
+        run: async (teddy, template, model, assert, expected) => {
+          teddy.setIncludeNotFoundBehavior('hide')
+          const result = teddy.render('<div><include src="thisTemplateDoesNotExist"></include></div>', {})
+          teddy.setIncludeNotFoundBehavior('display') // put it back, since the other include tests expect the message
+          assert(result, expected)
+        },
+        expected: '<div></div>'
+      },
+      {
+        message: 'should go back to displaying an error for an include that cannot be found',
+        run: async (teddy, template, model, assert, expected) => {
+          teddy.setIncludeNotFoundBehavior('hide')
+          teddy.setIncludeNotFoundBehavior('display')
+          assert(teddy.render('<div><include src="thisTemplateDoesNotExist"></include></div>', {}), expected)
+        },
+        expected: '<div>Template "thisTemplateDoesNotExist" not found!</div>'
+      },
+      {
+        message: 'should list a template registered with setTemplate in getTemplates',
+        run: async (teddy, template, model, assert, expected) => {
+          teddy.setTemplate('getTemplatesProbe', '<p>probe</p>')
+          const registered = teddy.getTemplates()
+          assert(registered.getTemplatesProbe === '<p>probe</p>' ? 'listed' : `not listed: ${Object.keys(registered).length} template(s) registered`, expected)
+        },
+        expected: 'listed'
+      }
+    ]
   },
   {
     describe: 'Bundler tests',

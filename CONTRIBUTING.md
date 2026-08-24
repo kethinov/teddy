@@ -13,6 +13,8 @@ On Linux, WebKit needs some system libraries that may not be present. If a brows
 
 - Be sure all tests pass: `npm t`.
 - Ensure good test coverage and write new tests if necessary: `npm run coverage`.
+  - The server and client halves of the suite cover different parts of Teddy and neither can reach all of it, so `npm run coverage` reports which lines neither half executes. Run `npm run coverage-server` or `npm run coverage-client` on their own if you only need one half, then `npm run coverage-report` to see the combined picture.
+- The caching tests measure how long a render takes, which is worth seeing when you are working on caching or performance and is noise the rest of the time. Set `TEDDY_TEST_TIMINGS` to print those measurements: `TEDDY_TEST_TIMINGS=1 npm run test-server`.
 - Add your changes to `CHANGELOG.md`.
 
 ## Release process
