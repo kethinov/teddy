@@ -1,3 +1,17 @@
+## 1.2.0
+
+- Breaking: Disabled template caching for templates read from the filesystem by default. Teddy used to keep every template it read and never read it again, so editing a template had no effect until the process restarted or `teddy.clearTemplates()` was called. Caching is now off by default, which is how most other templating engines (e.g. ejs or pug) treat their own caching, so a template that changes on disk is picked up on the next render.
+  - If you use Teddy as an Express view engine you do not need to do anything: Express supplies its own `view cache` setting, which it enables in production and disables in development, and Teddy now uses it. That means production keeps caching and development stops needing a restart.
+  - Templates registered with `teddy.setTemplate` are unaffected. Those are always kept, since registering one by hand is the only way to supply a template in the browser.
+  - To get the old behavior back, call `teddy.setCacheTemplates(true)` when instantiating Teddy, or pass `cache: true` in the model on each render.
+- Added `teddy.setCacheTemplates(boolean)` to control the above, and support for a `cache` option in the model, which takes precedence over both that setter and Express's `view cache`.
+- Altered `teddy.clearTemplates()` to now clear the templates that were read from the filesystem, not just the ones registered by hand.
+- Fixed `<include>` resolving its partial through the template registry rather than through the loader, which meant an included template could not be re-read after it changed.
+- Fixed one line conditionals so that a sequence of them on the same element is evaluated in full, rather than all but one being discarded. `<p if-a true='class="x"' if-b true='data-y="z"'>` now applies both outcomes.
+- Improved performance considerably in several places.
+- Made various improvements to the automated test suite.
+- Updated dependencies.
+
 ## 1.1.4
 
 - Added slicker live demo docs.

@@ -39,6 +39,34 @@ function registerTemplates (dir) {
 }
 const templates = registerTemplates('test/templates')
 
+// loading the bundle and registering every template costs far more than the assertion each test then makes, and neither depends on anything a test does, so the page is prepared once per worker and reused
+// no test touches the document, they only compare what teddy renders to a string, so sharing one is safe
+const teddyTest = playwrightTest.extend({
+  teddyPage: [async ({ browser }, use) => {
+    const page = await browser.newPage()
+    await page.setContent(`<!DOCTYPE html>
+      <html lang="en">
+        <head>
+          <meta charset="utf-8">
+          <title>Teddy Playwright Tests</title>
+        </head>
+        <body></body>
+      </html>`)
+    await page.addScriptTag({ path: path.resolve(__dirname, '../../dist/teddy.js') })
+    await page.evaluate((templates) => {
+      for (const template of templates) window.teddy.setTemplate(template.path, template.content)
+      window.teddy.setTemplateRoot('test/templates')
+    }, templates)
+    await use(page)
+    if (process.env.NYC_PROCESS_ID) {
+      // one coverage file per worker rather than one per test, which is hundreds fewer files for nyc to merge
+      const coverage = await page.evaluate(() => window.__coverage__)
+      if (coverage) fs.writeFileSync(path.join(process.cwd(), '.nyc_output', `coverage-worker-${process.pid}-${Date.now()}.json`), JSON.stringify(coverage))
+    }
+    await page.close()
+  }, { scope: 'worker' }]
+})
+
 function runPlaywrightAgainstTeddyBundle (teddyPath) {
   playwrightTest.describe('Test that client-side bundles load', () => {
     const teddyNonMinified = path.resolve(__dirname, '../../dist/teddy.js')
@@ -75,39 +103,22 @@ function runPlaywrightAgainstTeddyBundle (teddyPath) {
         if (test.runPlaywright) test.run = test.runPlaywright
         if (!test.run) continue
         else {
-          playwrightTest(`${test.message} (dist/${fileName})`, async ({ page }) => {
+          teddyTest(`${test.message} (dist/${fileName})`, async ({ teddyPage }) => {
             // to debug, uncomment this:
-            // page.on('console', (msg) => console.log(msg))
+            // teddyPage.on('console', (msg) => console.log(msg))
             // for deeper debugging: export DEBUG=pw:browser
 
             const model = makeModel()
-
-            // set an initial DOM
-            await page.setContent(`<!DOCTYPE html>
-            <html lang="en">
-              <head>
-                <meta charset="utf-8">
-                <meta name="viewport" content="width=device-width,initial-scale=1">
-                <meta name="format-detection" content="telephone=no">
-                <title>Teddy Playwright Tests</title>
-              </head>
-              <body>
-              </body>
-            </html>`)
-            await page.addScriptTag({ path: test.bundle || teddyPath }) // add teddy script tag to the browser page
+            const page = teddyPage
             test.run = test.run?.toString() || '' // can't pass functions to page.evaluate, so we need to stringify the test.run function
 
             await page.evaluate(async (params) => {
-              const { test, templates, model } = params
-
-              // load templates into browser context
-              for (const template of templates) window.teddy.setTemplate(template.path, template.content)
-              window.teddy.setTemplateRoot('test/templates')
+              const { test, model } = params
 
               // fix the Set test by remaking the Set
               model.set = new Set(['a', 'b', 'c'])
 
-              // convert test.run method back from string to an actual excutable function
+              // convert test.run method back from string to an actual executable function
               test.run = eval(test.run) // eslint-disable-line
               await test.run(window.teddy, test.template, model, teddyAssert, test.expected)
 
@@ -130,13 +141,7 @@ function runPlaywrightAgainstTeddyBundle (teddyPath) {
                 if (typeof str !== 'string') return str
                 return str.replace(/\s/g, '')
               }
-            }, { test, templates, model })
-          })
-          playwrightTest.afterEach(async ({ page }) => {
-            if (process.env.NYC_PROCESS_ID) {
-              const coverage = await page.evaluate(() => window.__coverage__)
-              if (coverage) fs.writeFileSync(path.join(process.cwd(), '.nyc_output', `coverage-${playwrightTest.info().testId}.json`), JSON.stringify(coverage))
-            }
+            }, { test, model })
           })
         }
       }

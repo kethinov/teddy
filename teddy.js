@@ -4,71 +4,71 @@ import fs from 'fs' // node filesystem module
 import path from 'path' // node path module
 import { load as cheerioLoad } from 'cheerio/slim' // dom parser
 
-const cheerioOptions = { xml: { xmlMode: false, lowerCaseAttributeNames: false, decodeEntities: false } }
+const cheerioOptions = { lowerCaseAttributeNames: false, decodeEntities: false }
 const browser = cheerioLoad.isCheerioPolyfill // true if we are executing in the browser context
 const params = {} // teddy parameters
 setDefaultParams() // set params to the defaults
-let templates = {} // loaded templates are stored as object collections, e.g. { "myTemplate.html": "<p>some markup</p>"}
+let templates = {} // templates registered by hand with setTemplate, e.g. { "myTemplate.html": "<p>some markup</p>"}; this is how templates reach the browser, where there is no filesystem to read them from
+let fileCache = {} // templates that were read from the filesystem, kept only when template caching is switched on
 const caches = {} // a place to store cached portions of templates
+// building a regular expression costs far more than using one, and a loop substitutes the same variables out of the same body on every iteration, so the patterns are compiled once and kept
+const varPatterns = new Map()
+function varPattern (source, escape) {
+  const key = escape ? source : '\u0000raw:' + source
+  let pattern = varPatterns.get(key)
+  if (pattern === undefined) {
+    pattern = new RegExp(escape ? source.replace(/[|\\{}()[\]^$+*?.]/g, '\\$&').replace(/-/g, '\\x2d') : source, 'i')
+    if (varPatterns.size > 10000) varPatterns.clear() // a model that invents variable names without bound must not grow this forever
+    varPatterns.set(key, pattern)
+  }
+  return pattern
+}
 const templateCaches = {} // a place to store cached full templates
 
 // #endregion
 
 // #region private methods
 
-// loads the template from the filesystem
+// resolves a template to its markup:
+// a template may be the markup itself, the name of a template registered with setTemplate, or the path of a file to read
+// returns null when a name is neither registered nor readable, so that callers can tell a template that is missing apart from one that legitimately rendered to nothing
 function loadTemplate (template) {
   // ensure template is a string
   if (typeof template !== 'string') {
     if (params.verbosity > 1) console.warn('teddy.loadTemplate attempted to load a template which is not a string.')
-    return ''
+    return null
   }
+
+  // markup passed in directly rather than a name to look up
+  if (template.includes('<')) return removeTeddyComments(template)
+
   const name = template
-  let register = false
-  if (!templates[template] && template.indexOf('<') === -1 && fs && fs.readFileSync) {
-    // template is not found, it is not code, and we're in the node.js context
-    register = true
-    // append extension if not present
-    if (template.slice(-5) !== '.html') template += '.html'
-    try {
-      template = fs.readFileSync(template, 'utf8')
-    } catch (e) {
+  const withExtension = name.slice(-5) === '.html' ? name : name + '.html'
+
+  // a template registered by hand wins over anything on the filesystem, which is what makes the same template work in the browser
+  for (const key of [name, withExtension]) {
+    if (typeof templates[key] === 'string') return removeTeddyComments(templates[key])
+  }
+
+  // then whatever was read from the filesystem last time, if the caller asked for templates to be cached
+  if (params.cacheTemplates && typeof fileCache[name] === 'string') return fileCache[name]
+
+  // then the filesystem itself
+  if (fs && fs.readFileSync) {
+    for (const candidate of [withExtension, params.templateRoot + withExtension, params.templateRoot + '/' + withExtension]) {
+      let contents
       try {
-        template = fs.readFileSync(params.templateRoot + template, 'utf8')
+        contents = fs.readFileSync(candidate, 'utf8')
       } catch (e) {
-        try {
-          template = fs.readFileSync(params.templateRoot + '/' + template, 'utf8')
-        } catch (e) {
-          // do nothing, attempt to render it as code
-          register = false
-        }
+        continue // try the next place it might be
       }
-    }
-  } else {
-    if (templates[template]) {
-      template = templates[template]
-      register = true
-    } else {
-      // didn't find it; append extension if not present and check it again
-      if (template.slice(-5) !== '.html') {
-        template += '.html'
-      }
-      if (templates[template]) {
-        template = templates[template]
-        register = true
-      }
-      template = removeTeddyComments(template)
+      contents = removeTeddyComments(contents)
+      if (params.cacheTemplates) fileCache[name] = contents
+      return contents
     }
   }
-  if (register) {
-    // register the new template and return the code
-    template = removeTeddyComments(template)
-    templates[name] = template
-    return template
-  } else {
-    // return the template name which is presumed to be code
-    return template.slice(-5) === '.html' ? template.substring(0, template.length - 5) : template
-  }
+
+  return null // it is not a registered template and there is no file by that name
 }
 
 // remove teddy {! comments !} and <!--! comments -->; also replace <escape>tags</escape> and <!--# content -->
@@ -217,10 +217,10 @@ function parseIncludes (dom, model, dynamic) {
           dom(el).attr('teddydeferreddynamicinclude', 'true') // mark it dynamic and then skip it
           continue
         }
-        loadTemplate(src) // load the partial into the template list
-        let contents = templates[src] || ''
-        if (typeof templates[src] !== 'string' && params.includeNotFoundBehavior === 'display') {
-          contents = `Template "${src}" not found!`
+        const included = loadTemplate(src)
+        let contents = included || ''
+        if (included === null) {
+          if (params.includeNotFoundBehavior === 'display') contents = `Template "${src}" not found!`
           if (params.verbosity > 1) console.warn(`teddy encountered an include tag with a src set to a template that could not be found: ${src}`)
         }
         const localModel = Object.assign({}, model)
@@ -559,41 +559,49 @@ function parseOneLineConditionals (dom, model) {
         }
         if (next) continue
         // get conditions
-        let ifTrue
-        let ifFalse
+        //
+        // an element can carry a sequence of one line conditionals rather than only one: a condition, any further conditions joined to it by and, or, or xor, then the true and false outcomes for that condition, and then possibly another condition beginning the next one in the sequence
+        //
+        // the outcomes are what separate one from the next, so a condition that turns up after an outcome has already been given starts a new conditional, while one that turns up before that is part of the condition being built
         if (browser) el.attribs = getAttribs(el)
-        const args = []
+        const conditionals = []
+        let conditional = null
+        let lastWasCondition = false
+        let lastWasJoiner = false
         for (const origAttr in el.attribs) {
           let attr = origAttr
           let val = el.attribs[attr]
           if (attr.includes('-teddyduplicate')) attr = attr.split('-teddyduplicate')[0] // the condition is a duplicate, so remove the `-teddyduplicate1` from `conditionName-teddyduplicate1`, `conditionName-teddyduplicate2`, etc
           if (val?.startsWith('{')) val = parseVars(val, model)
           if (attr.startsWith('if-')) {
+            if (lastWasCondition && !lastWasJoiner && params.verbosity > 1) console.warn(`teddy encountered a one line conditional that begins another condition before saying what to do with the previous one: ${origAttr}`)
+            if (!conditional || conditional.ifTrue !== undefined || conditional.ifFalse !== undefined) {
+              // an outcome has already been given, so this condition belongs to the next conditional rather than this one
+              conditional = { args: [], ifTrue: undefined, ifFalse: undefined }
+              conditionals.push(conditional)
+            }
             const parts = attr.split('if-')
-            if (val) args.push(`${parts[1]}=${val}`)
-            else args.push(parts[1])
+            if (val) conditional.args.push(`${parts[1]}=${val}`)
+            else conditional.args.push(parts[1])
             dom(el).removeAttr(origAttr)
-          } else if (attr === 'true') {
-            ifTrue = val.replaceAll('&quot;', '"') // true="class='blah'"
+            lastWasCondition = true
+            lastWasJoiner = false
+          } else if (attr === 'true' || attr === 'false') {
+            if (conditional) conditional[attr === 'true' ? 'ifTrue' : 'ifFalse'] = val.replaceAll('&quot;', '"') // true="class='blah'"
             dom(el).removeAttr(origAttr)
-          } else if (attr === 'false') {
-            ifFalse = val.replaceAll('&quot;', '"') // false="class='blah'"
-            dom(el).removeAttr(origAttr)
+            lastWasCondition = false
+            lastWasJoiner = false
           } else if (attr === 'and' || attr === 'or' || attr === 'xor') {
-            args.push(attr)
+            if (conditional) conditional.args.push(attr)
             dom(el).removeAttr(origAttr)
+            lastWasJoiner = true
           }
         }
-        // evaluate conditional
-        if (evaluateConditional(args, model)) {
-          if (ifTrue) {
-            const parts = ifTrue.split('=')
-            dom(el).attr(parts[0], parts[1] ? parts[1].replace(/["']/g, '') : '')
-          }
-          parsedTags++
-        } else if (ifFalse) {
-          if (ifFalse) {
-            const parts = ifFalse.split('=')
+        // evaluate each conditional in the sequence and apply whichever outcome it calls for
+        for (const item of conditionals) {
+          const outcome = evaluateConditional(item.args, model) ? item.ifTrue : item.ifFalse
+          if (outcome) {
+            const parts = outcome.split('=')
             dom(el).attr(parts[0], parts[1] ? parts[1].replace(/["']/g, '') : '')
           }
           parsedTags++
@@ -663,17 +671,28 @@ function parseLoops (dom, model) {
           const hasLoop = localMarkup.includes('</loop>')
           const hasInline = localMarkup.includes('</inline>')
           const hasSelected = localMarkup.includes(' selected-value=') || localMarkup.includes(' checked-value=')
-          let localDom = cheerioLoad(localMarkup || '', cheerioOptions)
-          if (hasNoteddy || hasNoparse) localDom = tagNoParseBlocks(localDom, localModel)
-          if (hasIf || hasUnless) localDom = parseConditionals(localDom, localModel)
-          if (hasTrue || hasFalse) localDom = parseOneLineConditionals(localDom, localModel)
-          if (hasLoop) localDom = parseLoops(localDom, localModel)
-          if (hasInline) localDom = parseInlines(localDom, localModel)
-          if (hasSelected) localDom = parseSelectedAttributeValues(localDom, localModel)
-          newMarkup += localDom.html()
+          const iterationNeedsDom = browser || hasNoteddy || hasNoparse || hasIf || hasUnless || hasTrue || hasFalse || hasLoop || hasInline || hasSelected // only use the DOM parser when it is actually needed
+          if (iterationNeedsDom) {
+            let localDom = cheerioLoad(localMarkup || '', cheerioOptions)
+            if (hasNoteddy || hasNoparse) localDom = tagNoParseBlocks(localDom, localModel)
+            if (hasIf || hasUnless) localDom = parseConditionals(localDom, localModel)
+            if (hasTrue || hasFalse) localDom = parseOneLineConditionals(localDom, localModel)
+            if (hasLoop) localDom = parseLoops(localDom, localModel)
+            if (hasInline) localDom = parseInlines(localDom, localModel)
+            if (hasSelected) localDom = parseSelectedAttributeValues(localDom, localModel)
+            newMarkup += localDom.html()
+          } else newMarkup += localMarkup
         }
-        const newDom = cheerioLoad(newMarkup || '', cheerioOptions)
-        dom(el).replaceWith(newDom.html())
+        // the loop output goes in as one raw node rather than as markup for cheerio to parse
+        //
+        // cheerio parses whatever markup it is handed and splices the elements in one at a time, at a cost growing with the square of the output. in one benchmark done at the time of writing, 8000 rows spent over 400ms being spliced into a document it is about to be serialized straight back out of again
+        //
+        // teddy asks cheerio not to touch entities, so a raw node comes back out exactly as it went in
+        //
+        // a raw node is invisible to a selector, so anything the steps after this one still have to find goes in as real markup instead: an <option> a select's selected-value has to match, an <inline>, a <cache>, or a block whose contents are exempt from parsing
+        const stillNeedsFinding = /<(option|inline|cache|noteddy|noparse|pre)[\s>]/i.test(newMarkup)
+        if (browser || stillNeedsFinding) dom(el).replaceWith(newMarkup || '')
+        else dom(el).replaceWith({ type: 'text', data: newMarkup || '' })
         parsedTags++
       }
     }
@@ -772,8 +791,8 @@ function parseVars (templateString, model) {
       const originalMatch = match
       match = parseVars(match, model)
       try {
-        templateString = templateString.replace(new RegExp(`\${${originalMatch}}`, 'i'), () => `\${${match}}`)
-        templateString = templateString.replace(new RegExp(`{${originalMatch}}`, 'i'), () => `{${match}}`)
+        templateString = templateString.replace(varPattern(`\${${originalMatch}}`, false), () => `\${${match}}`)
+        templateString = templateString.replace(varPattern(`{${originalMatch}}`, false), () => `{${match}}`)
       } catch (e) {
         if (params.verbosity > 2) console.warn(`teddy.parseVars encountered a {variable} that could not be parsed: {${originalMatch}}`)
       }
@@ -789,8 +808,8 @@ function parseVars (templateString, model) {
         const id = model._noTeddyBlocks.push(parsed) - 1
         try {
           try {
-            templateString = templateString.replace(new RegExp(`\${${originalMatch}}`.replace(/[|\\{}()[\]^$+*?.]/g, '\\$&').replace(/-/g, '\\x2d'), 'i'), `<noteddy id="${id}"></noteddy>`)
-            templateString = templateString.replace(new RegExp(`{${originalMatch}}`.replace(/[|\\{}()[\]^$+*?.]/g, '\\$&').replace(/-/g, '\\x2d'), 'i'), `<noteddy id="${id}"></noteddy>`)
+            templateString = templateString.replace(varPattern(`\${${originalMatch}}`, true), `<noteddy id="${id}"></noteddy>`)
+            templateString = templateString.replace(varPattern(`{${originalMatch}}`, true), `<noteddy id="${id}"></noteddy>`)
           } catch (e) {
             if (params.verbosity > 2) console.warn(`teddy.parseVars encountered a {variable} that could not be parsed: {${originalMatch}}`)
           }
@@ -810,8 +829,8 @@ function parseVars (templateString, model) {
       }
       if (typeof parsed === 'string' && parsed.startsWith('{') && parsed.includes('|d')) parsed = parsed.replace('|d', '')
       try {
-        if (!skipTemplateLiteralReplacement) templateString = templateString.replace(new RegExp(`\${${originalMatch}}`.replace(/[|\\{}()[\]^$+*?.]/g, '\\$&').replace(/-/g, '\\x2d'), 'i'), () => parsed)
-        templateString = templateString.replace(new RegExp(`{${originalMatch}}`.replace(/[|\\{}()[\]^$+*?.]/g, '\\$&').replace(/-/g, '\\x2d'), 'i'), () => parsed)
+        if (!skipTemplateLiteralReplacement) templateString = templateString.replace(varPattern(`\${${originalMatch}}`, true), () => parsed)
+        templateString = templateString.replace(varPattern(`{${originalMatch}}`, true), () => parsed)
       } catch (e) {
         return templateString
       }
@@ -827,8 +846,8 @@ function parseVars (templateString, model) {
       }
       if (typeof parsed === 'string' && parsed.startsWith('{') && parsed.includes('|d')) parsed = parsed.replace('|d', '')
       try {
-        if (!skipTemplateLiteralReplacement) templateString = templateString.replace(new RegExp(`\${${match}}`.replace(/[|\\{}()[\]^$+*?.]/g, '\\$&').replace(/-/g, '\\x2d'), 'i'), () => parsed)
-        templateString = templateString.replace(new RegExp(`{${match}}`.replace(/[|\\{}()[\]^$+*?.]/g, '\\$&').replace(/-/g, '\\x2d'), 'i'), () => parsed)
+        if (!skipTemplateLiteralReplacement) templateString = templateString.replace(varPattern(`\${${match}}`, true), () => parsed)
+        templateString = templateString.replace(varPattern(`{${match}}`, true), () => parsed)
       } catch (e) {
         return templateString
       }
@@ -912,6 +931,7 @@ const escapeHtmlEntities = {
 }
 const entityKeys = Object.keys(escapeHtmlEntities)
 const ekl = entityKeys.length
+const needsEscaping = /[&<>"']/ // most values have nothing in them that needs escaping, and finding that out with one scan costs far less than rebuilding the whole value a character at a time to arrive at the same string; this is deliberately not a replace: for a value that is dense with entities, the loop below is faster than a regex is
 function escapeEntities (value) {
   let escapedEntity = false
   let newValue = ''
@@ -928,6 +948,8 @@ function escapeEntities (value) {
   } else if (value === undefined) return false // cannot escape on this value; undefined is falsey
   else if (typeof value === 'boolean' || typeof value === 'number') return value // cannot escape on these values; if it's already a boolean or a number just return it
   else {
+    if (!needsEscaping.test(value)) return value // nothing to escape, so the value is already what the loop below would build
+
     // loop through value to find html entities
     for (i = 0; i < value.length; i++) {
       escapedEntity = false
@@ -1067,6 +1089,7 @@ function setDefaultParams () {
   params.maxPasses = 1000
   params.emptyVarBehavior = 'display' // or 'hide'
   params.includeNotFoundBehavior = 'display' // or 'hide'
+  params.cacheTemplates = false // whether to keep templates read from the filesystem in memory rather than reading them again on the next render
 }
 
 // mutator method to set verbosity param. takes human-readable string argument and converts it to an integer for more efficient checks against the setting
@@ -1113,6 +1136,14 @@ function setIncludeNotFoundBehavior (v) {
   else params.includeNotFoundBehavior = 'display'
 }
 
+// mutator method to set whether templates read from the filesystem are kept in memory
+// off by default, matching how most other templating engines (e.g. ejs and pug) treat their own caching, so that editing a template takes effect without a restart
+// express sets its own `view cache` setting per mode and teddy picks that up in render, so an express app gets caching in
+// production and fresh reads in development without having to ask for either
+function setCacheTemplates (v) {
+  params.cacheTemplates = !!v
+}
+
 // access templates
 function getTemplates () {
   return templates
@@ -1133,6 +1164,7 @@ function setTemplate (file, template) {
 // mutator method to clear template cache entirely
 function clearTemplates () {
   templates = {}
+  fileCache = {}
 }
 
 function setCache (params) {
@@ -1189,6 +1221,11 @@ function render (template, model, callback) {
 
   // express.js support
   if (model.settings && model.settings.views && path) params.templateRoot = path.resolve(model.settings.views)
+
+  // caching is taken from the render options the way other templating engines (e.g. ejs and pug) take theirs, so that whoever is calling teddy decides
+  // an explicit `cache` option wins; otherwise express' own `view cache` setting is used, which express turns on in production and off in development, so an express app gets the right behavior without asking for it
+  if (typeof model.cache === 'boolean') params.cacheTemplates = model.cache
+  else if (model.settings && typeof model.settings['view cache'] === 'boolean') params.cacheTemplates = model.settings['view cache']
 
   // remove templateRoot from template name if necessary
   if (template.slice(params.templateRoot.length) === params.templateRoot) template = template.replace(params.templateRoot, '')
@@ -1251,24 +1288,25 @@ function render (template, model, callback) {
   // start the render
   renderedTemplate = loadTemplate(template)
 
-  // replace duplicate attributes with temporary unique names before loading into cheerio
-  if (!browser) {
-    renderedTemplate = renderedTemplate.replace(/<([a-zA-Z][a-zA-Z0-9-]*)([^>]*)>/g, (match, tagName, attributes) => {
-      const attrRegex = /([a-zA-Z0-9-:._]+)(?:=(["'])(.*?)\2|([^>\s]+))?/g
-      const attrMap = new Map()
-      let count = 1
-      const processedAttributes = attributes.replace(attrRegex, (attrMatch, attrName, quote, attrValue) => {
-        if (attrMap.has(attrName)) {
-          const newAttrName = `${attrName}-teddyduplicate${count++}`
-          return attrMatch.replace(attrName, newAttrName)
-        } else {
-          attrMap.set(attrName, true)
-          return attrMatch
-        }
-      })
-      return `<${tagName}${processedAttributes}>`
+  // a name that resolves to nothing falls back to being rendered as though it were markup
+  if (renderedTemplate === null) renderedTemplate = template.slice(-5) === '.html' ? template.substring(0, template.length - 5) : template
+
+  // give every repeated attribute name a unique one before the markup is parsed since html parsers strip duplicate attributes
+  renderedTemplate = renderedTemplate.replace(/<([a-zA-Z][a-zA-Z0-9-]*)([^>]*)>/g, (match, tagName, attributes) => {
+    const attrRegex = /([a-zA-Z0-9-:._]+)(?:=(["'])(.*?)\2|([^>\s]+))?/g
+    const attrMap = new Map()
+    let count = 1
+    const processedAttributes = attributes.replace(attrRegex, (attrMatch, attrName, quote, attrValue) => {
+      if (attrMap.has(attrName)) {
+        const newAttrName = `${attrName}-teddyduplicate${count++}`
+        return attrMatch.replace(attrName, newAttrName)
+      } else {
+        attrMap.set(attrName, true)
+        return attrMatch
+      }
     })
-  }
+    return `<${tagName}${processedAttributes}>`
+  })
 
   dom = cheerioLoad(renderedTemplate || '', cheerioOptions)
   let oldTemplate
@@ -1378,6 +1416,7 @@ export default {
   setMaxPasses,
   setEmptyVarBehavior,
   setIncludeNotFoundBehavior,
+  setCacheTemplates,
   getTemplates,
   setTemplate,
   clearTemplates,
