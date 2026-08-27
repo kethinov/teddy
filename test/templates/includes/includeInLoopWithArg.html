@@ -1,0 +1,11 @@
+{!
+  should <include> a template from inside a <loop> with an <arg> whose value comes from the loop's val
+!}
+
+<ul>
+  <loop through='loopWithIncludes' val='item'>
+    <include src='includes/includeInLoopWithArgPartial'>
+      <arg label><b>{item.name}</b></arg>
+    </include>
+  </loop>
+</ul>

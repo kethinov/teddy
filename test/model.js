@@ -79,6 +79,10 @@ export default function makeModel () {
         ]
       }
     ],
+    loopWithIncludes: [
+      { name: 'first', active: true, tags: ['a', 'b'] },
+      { name: 'second', active: false, tags: ['c'] }
+    ],
     something: 'Some content',
     somethingTrue: true,
     somethingFalse: false,

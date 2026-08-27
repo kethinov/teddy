@@ -528,6 +528,18 @@ export default [
         expected: '<p class="populated">Is it populated? populated</p>'
       },
       {
+        message: "should <include> a template from inside a <loop> and let the partial's teddy tags read the loop's val (includes/includeInLoop.html)",
+        template: 'includes/includeInLoop',
+        run: async (teddy, template, model, assert, expected) => assert(teddy.render(template, model), expected),
+        expected: '<ul><li class="active"><span>first is active</span><em>a</em><em>b</em></li><li class="inactive"><span>second is inactive</span><em>c</em></li></ul>'
+      },
+      {
+        message: "should <include> a template from inside a <loop> with an <arg> whose value comes from the loop's val (includes/includeInLoopWithArg.html)",
+        template: 'includes/includeInLoopWithArg',
+        run: async (teddy, template, model, assert, expected) => assert(teddy.render(template, model), expected),
+        expected: '<ul><li><b>first</b>: on</li><li><b>second</b>: off</li></ul>'
+      },
+      {
         message: 'should <include> a template with arguments (includes/includeWithArguments.html)',
         template: 'includes/includeWithArguments',
         run: async (teddy, template, model, assert, expected) => assert(teddy.render(template, model), expected),
