@@ -1,0 +1,15 @@
+{!
+  when included by includeInLoop.html, this partial's teddy tags should see the loop's val
+!}
+
+<li if-item.active true="class='active'" false="class='inactive'">
+  <if item.active>
+    <span>{item.name} is active</span>
+  </if>
+  <else>
+    <span>{item.name} is inactive</span>
+  </else>
+  <loop through='item.tags' val='tag'>
+    <em>{tag}</em>
+  </loop>
+</li>

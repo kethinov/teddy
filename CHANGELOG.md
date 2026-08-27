@@ -1,3 +1,8 @@
+## 1.2.1
+
+- Fixed `<include>` tags inside a `<loop>` so that the included partial's `<if>`, `<unless>`, one line conditionals, and nested `<loop>` tags can read the loop's `key` and `val`. Previously the partial's contents were parsed against the model as it stood outside the loop, so a partial could print the loop's `val` through a `{variable}` but any tag that branched on it behaved as though it were not there. Includes are now expanded by the loop, once per iteration, against that iteration's model, which is how partials behave in other templating engines.
+- Updated dependencies.
+
 ## 1.2.0
 
 - Breaking: Disabled template caching for templates read from the filesystem by default. Teddy used to keep every template it read and never read it again, so editing a template had no effect until the process restarted or `teddy.clearTemplates()` was called. Caching is now off by default, which is how most other templating engines (e.g. ejs or pug) treat their own caching, so a template that changes on disk is picked up on the next render.

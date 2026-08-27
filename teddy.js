@@ -191,7 +191,9 @@ function parseIncludes (dom, model, dynamic) {
     else tags = dom('include:not([teddydeferreddynamicinclude])') // parse only includes that aren't dynamic
     if (tags.length > 0) {
       for (const el of tags) {
-        // ensure this isn't the child of a no parse block
+        // an include inside a no parse block is not teddy's to expand
+        //
+        // an include inside a loop is the loop's to expand, not this function's: the loop parses its body once per iteration against a local model that has the loop's key and val in it, and it expands any include it finds there with that model. expanding the include here instead would resolve the partial's <if>, <loop>, and one-line conditionals against a model with no loop variable in it, so a partial could read the loop's val through a {variable} but not branch on it
         let foundBody = false
         let next = false
         let parent = el.parent || el.parentNode
@@ -199,7 +201,7 @@ function parseIncludes (dom, model, dynamic) {
           let parentName
           if (!parent) parentName = 'body'
           else parentName = parent.nodeName?.toLowerCase() || parent.name
-          if (parentName === 'noparse' || parentName === 'noteddy') {
+          if (parentName === 'noparse' || parentName === 'noteddy' || parentName === 'loop') {
             next = true
             break
           } else if (parentName === 'body') foundBody = true
@@ -668,15 +670,18 @@ function parseLoops (dom, model) {
           const hasUnless = localMarkup.includes('</unless>')
           const hasTrue = localMarkup.includes(' true=')
           const hasFalse = localMarkup.includes(' false=')
+          const hasInclude = localMarkup.includes('</include>')
           const hasLoop = localMarkup.includes('</loop>')
           const hasInline = localMarkup.includes('</inline>')
           const hasSelected = localMarkup.includes(' selected-value=') || localMarkup.includes(' checked-value=')
-          const iterationNeedsDom = browser || hasNoteddy || hasNoparse || hasIf || hasUnless || hasTrue || hasFalse || hasLoop || hasInline || hasSelected // only use the DOM parser when it is actually needed
+          const iterationNeedsDom = browser || hasNoteddy || hasNoparse || hasIf || hasUnless || hasTrue || hasFalse || hasInclude || hasLoop || hasInline || hasSelected // only use the DOM parser when it is actually needed
           if (iterationNeedsDom) {
             let localDom = cheerioLoad(localMarkup || '', cheerioOptions)
             if (hasNoteddy || hasNoparse) localDom = tagNoParseBlocks(localDom, localModel)
             if (hasIf || hasUnless) localDom = parseConditionals(localDom, localModel)
             if (hasTrue || hasFalse) localDom = parseOneLineConditionals(localDom, localModel)
+            // the same order the main render pass uses: an include is expanded before the loops around it, and the partial it pulls in is parsed against this iteration's model, so a partial can branch on the loop's val the way it can in other templating engines
+            if (hasInclude) localDom = parseIncludes(localDom, localModel)
             if (hasLoop) localDom = parseLoops(localDom, localModel)
             if (hasInline) localDom = parseInlines(localDom, localModel)
             if (hasSelected) localDom = parseSelectedAttributeValues(localDom, localModel)

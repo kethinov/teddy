@@ -1,0 +1,9 @@
+{!
+  should <include> a template from inside a <loop> and let the partial's teddy tags read the loop's val
+!}
+
+<ul>
+  <loop through='loopWithIncludes' val='item'>
+    <include src='includes/includeInLoopPartial'></include>
+  </loop>
+</ul>
