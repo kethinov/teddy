@@ -50,9 +50,6 @@ templateFunction({ hello: 'world' }) // returns "<p>world</p>"
           <p><code>teddy.setDefaultParams()</code>: Reset all params to default.</p>
         </li>
         <li>
-          <p><code>teddy.maxPasses(n)</code>: Sets the maximum number of passes the parser can execute over your template. If this maximum is exceeded, Teddy will stop attempting to render the template. The limit exists to prevent the possibility of teddy producing infinite loops due to improperly coded templates. Default: <code>1000</code>.</p>
-        </li>
-        <li>
           <p><code>teddy.setEmptyVarBehavior('hide')</code>: Will make it possible for variables which don't resolve to display as empty strings instead of displaying the variable. Default: <code>'display'</code>.</p>
           <ul>
             <li><code><noparse>{varName|h}</noparse></code> to force it to hide or <code><noparse>{varName|d}</noparse></code></li>

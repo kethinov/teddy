@@ -163,7 +163,9 @@ export default [
         path: false
       },
       alias: {
-        'cheerio/slim': path.resolve(__dirname, 'cheerioPolyfill.js')
+        'cheerio/slim': path.resolve(__dirname, 'cheerioPolyfill.js'),
+        // emitting javascript builds a function from a string, which a strict content security policy forbids, so browser builds walk the node tree instead and do not carry the emitter at all
+        './codegen.js': path.resolve(__dirname, 'codegenStub.js')
       }
     },
     module: process.argv.includes('coverage')
@@ -220,7 +222,9 @@ export default [
         path: false
       },
       alias: {
-        'cheerio/slim': path.resolve(__dirname, 'cheerioPolyfill.js')
+        'cheerio/slim': path.resolve(__dirname, 'cheerioPolyfill.js'),
+        // emitting javascript builds a function from a string, which a strict content security policy forbids, so browser builds walk the node tree instead and do not carry the emitter at all
+        './codegen.js': path.resolve(__dirname, 'codegenStub.js')
       }
     },
     module: process.argv.includes('coverage')
@@ -277,7 +281,9 @@ export default [
         path: false
       },
       alias: {
-        'cheerio/slim': path.resolve(__dirname, 'cheerioPolyfill.js')
+        'cheerio/slim': path.resolve(__dirname, 'cheerioPolyfill.js'),
+        // emitting javascript builds a function from a string, which a strict content security policy forbids, so browser builds walk the node tree instead and do not carry the emitter at all
+        './codegen.js': path.resolve(__dirname, 'codegenStub.js')
       }
     },
     module: process.argv.includes('coverage')
@@ -337,7 +343,9 @@ export default [
         path: false
       },
       alias: {
-        'cheerio/slim': path.resolve(__dirname, 'cheerioPolyfill.js')
+        'cheerio/slim': path.resolve(__dirname, 'cheerioPolyfill.js'),
+        // emitting javascript builds a function from a string, which a strict content security policy forbids, so browser builds walk the node tree instead and do not carry the emitter at all
+        './codegen.js': path.resolve(__dirname, 'codegenStub.js')
       }
     },
     module: process.argv.includes('coverage')
@@ -394,7 +402,9 @@ export default [
         path: false
       },
       alias: {
-        'cheerio/slim': path.resolve(__dirname, 'cheerioPolyfill.js')
+        'cheerio/slim': path.resolve(__dirname, 'cheerioPolyfill.js'),
+        // emitting javascript builds a function from a string, which a strict content security policy forbids, so browser builds walk the node tree instead and do not carry the emitter at all
+        './codegen.js': path.resolve(__dirname, 'codegenStub.js')
       }
     },
     module: process.argv.includes('coverage')

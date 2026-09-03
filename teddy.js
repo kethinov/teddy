@@ -3,6 +3,8 @@
 import fs from 'fs' // node filesystem module
 import path from 'path' // node path module
 import { load as cheerioLoad } from 'cheerio/slim' // dom parser
+import { createCompiler } from './compiler.js' // walks a template once so a render does not have to
+import { canEmit, emit } from './codegen.js' // turns what the compiler worked out into javascript; browser builds swap this for a stub
 
 const cheerioOptions = { lowerCaseAttributeNames: false, decodeEntities: false }
 const browser = cheerioLoad.isCheerioPolyfill // true if we are executing in the browser context
@@ -10,6 +12,8 @@ const params = {} // teddy parameters
 setDefaultParams() // set params to the defaults
 let templates = {} // templates registered by hand with setTemplate, e.g. { "myTemplate.html": "<p>some markup</p>"}; this is how templates reach the browser, where there is no filesystem to read them from
 let fileCache = {} // templates that were read from the filesystem, kept only when template caching is switched on
+let compiledCache = new Map() // node trees built by the compiler, kept on the same terms as fileCache: only when template caching is switched on, so that editing a template still takes effect without a restart
+const maxCompiledCache = 10000 // a caller that renders markup passed in as a string rather than by name must not grow this without bound
 const caches = {} // a place to store cached portions of templates
 // building a regular expression costs far more than using one, and a loop substitutes the same variables out of the same body on every iteration, so the patterns are compiled once and kept
 const varPatterns = new Map()
@@ -114,336 +118,8 @@ function removeTeddyComments (renderedTemplate) {
   return renderedTemplate
 }
 
-// find all cache elements and replace them with the rendered contents of their cache, then remove the cache element
-function replaceCacheElements (dom, model) {
-  let parsedTags
-  do {
-    parsedTags = 0
-    const tags = dom('cache:not([defer])')
-    if (tags.length > 0) {
-      for (const el of tags) {
-        if (browser) el.attribs = getAttribs(el)
-        const name = el.attribs.name
-        if (name.includes('{')) continue
-        const key = el.attribs.key || 'none'
-        if (key.includes('{')) continue
-        const cache = caches[name]
-        if (cache && cache.entries) {
-          const keyVal = el.attribs.key ? getOrSetObjectByDotNotation(model, key) : 'none'
-          if (cache.entries[keyVal]) {
-            const now = Date.now()
-            // if max age is not set, then there is no max age and the cache content is still valid
-            // or if last accessed + max age > now then the cache is not stale and the cache is still valid
-            if (!(cache.maxAge && !cache.maxage) || cache.entries[keyVal].lastAccessed + (cache.maxAge || cache.maxage) > now) {
-              const cacheContent = cache.entries[keyVal].markup
-              cache.entries[keyVal].lastAccessed = now
-              dom(el).replaceWith(cacheContent)
-            } else {
-              // if last accessed + max age <= now then the cache is stale and the cache is no longer valid
-              delete caches[name].entries[keyVal]
-              dom(el).attr('defer', 'true') // create a new cache
-            }
-          } else dom(el).attr('defer', 'true') // no cache exists for this yet; create after the template renders
-        } else dom(el).attr('defer', 'true') // no cache exists for this yet; create after the template renders
-        parsedTags++
-      }
-    }
-  } while (parsedTags)
-  return dom
-}
-
-// add an id to all <noteddy> or <noparse> tags, then remove their content temporarily until the template is fully parsed
-function tagNoParseBlocks (dom, model) {
-  let parsedTags
-  do {
-    parsedTags = 0
-    let tags = dom('noteddy:not([id]), noparse:not([id])')
-    if (tags.length > 0) {
-      for (const el of tags) {
-        const id = model._noTeddyBlocks.push(dom(el).html()) - 1
-        dom(el).replaceWith(`<noteddy id="${id}"></noteddy>`)
-        parsedTags++
-      }
-    }
-    tags = dom('pre:not([id]):not([parse])')
-    if (tags.length > 0) {
-      for (const el of tags) {
-        const id = model._noTeddyBlocks.push(dom(el).toString()) - 1
-        dom(el).replaceWith(`<noteddy id="${id}" pre="true"></noteddy>`)
-        parsedTags++
-      }
-    }
-  } while (parsedTags)
-  return dom
-}
-
-// parse <include> tags
-function parseIncludes (dom, model, dynamic) {
-  let parsedTags
-  let passes = 0
-  do {
-    passes++
-    if (passes > params.maxPasses) throw new Error(`teddy could not finish rendering the template because the max number of passes over the template (${params.maxPasses}) was exceeded; there may be an infinite loop in your template logic.`)
-    parsedTags = 0
-    let tags
-    // dynamic includes are includes like <include src="{sourcedFromVariable}"></include>
-    if (dynamic) tags = dom('include') // parse all includes
-    else tags = dom('include:not([teddydeferreddynamicinclude])') // parse only includes that aren't dynamic
-    if (tags.length > 0) {
-      for (const el of tags) {
-        // an include inside a no parse block is not teddy's to expand
-        //
-        // an include inside a loop is the loop's to expand, not this function's: the loop parses its body once per iteration against a local model that has the loop's key and val in it, and it expands any include it finds there with that model. expanding the include here instead would resolve the partial's <if>, <loop>, and one-line conditionals against a model with no loop variable in it, so a partial could read the loop's val through a {variable} but not branch on it
-        let foundBody = false
-        let next = false
-        let parent = el.parent || el.parentNode
-        while (!foundBody) {
-          let parentName
-          if (!parent) parentName = 'body'
-          else parentName = parent.nodeName?.toLowerCase() || parent.name
-          if (parentName === 'noparse' || parentName === 'noteddy' || parentName === 'loop') {
-            next = true
-            break
-          } else if (parentName === 'body') foundBody = true
-          else parent = parent.parent || parent.parentNode
-        }
-        if (next) continue
-        // get attributes
-        if (browser) el.attribs = getAttribs(el)
-        const src = el.attribs.src
-        if (!src) {
-          if (params.verbosity > 1) console.warn('teddy encountered an include tag with no src attribute.')
-          continue
-        }
-        if (src.startsWith('{')) {
-          dom(el).attr('teddydeferreddynamicinclude', 'true') // mark it dynamic and then skip it
-          continue
-        }
-        const included = loadTemplate(src)
-        let contents = included || ''
-        if (included === null) {
-          if (params.includeNotFoundBehavior === 'display') contents = `Template "${src}" not found!`
-          if (params.verbosity > 1) console.warn(`teddy encountered an include tag with a src set to a template that could not be found: ${src}`)
-        }
-        const localModel = Object.assign({}, model)
-        for (const arg of dom(el).children()) {
-          const argName = browser ? arg.nodeName?.toLowerCase() : arg.name
-          if (argName === 'arg') {
-            if (browser) arg.attribs = getAttribs(arg)
-            const argval = Object.keys(arg.attribs)[0]
-            getOrSetObjectByDotNotation(localModel, argval, dom(arg).html())
-          }
-        }
-        const hasNoteddy = contents.includes('</noteddy>')
-        const hasNoparse = contents.includes('</noparse>')
-        const hasPre = contents.includes('</pre>')
-        const hasIf = contents.includes('</if>')
-        const hasUnless = contents.includes('</unless>')
-        const hasTrue = contents.includes(' true=')
-        const hasFalse = contents.includes(' false=')
-        const hasLoop = contents.includes('</loop>')
-        const hasInline = contents.includes('</inline>')
-        const hasSelected = contents.includes(' selected-value=') || contents.includes(' checked-value=')
-        let localDom
-        if (hasNoteddy || hasNoparse || hasPre) {
-          localDom = cheerioLoad(contents, cheerioOptions)
-          localDom = tagNoParseBlocks(localDom, localModel)
-          contents = localDom.html()
-        }
-        localDom = cheerioLoad(parseVars(contents, localModel), cheerioOptions)
-        if (hasIf || hasUnless) localDom = parseConditionals(localDom, localModel)
-        if (hasTrue || hasFalse) localDom = parseOneLineConditionals(localDom, localModel)
-        if (hasLoop) localDom = parseLoops(localDom, localModel)
-        if (hasInline) localDom = parseInlines(localDom, localModel)
-        if (hasSelected) localDom = parseSelectedAttributeValues(localDom, localModel)
-        dom(el).replaceWith(localDom.html())
-        parsedTags++
-      }
-    }
-  } while (parsedTags)
-  return dom
-}
-
-// parse <if>, <elseif>, <unless>, <elseunless>, and <else> tags
-function parseConditionals (dom, model) {
-  let parsedTags
-  do {
-    parsedTags = 0
-    const tags = dom('if, unless')
-    if (tags.length > 0) {
-      for (const el of tags) {
-        // ensure this isn't the child of a loop or a no parse block
-        let foundBody = false
-        let next = false
-        let parent = el.parent || el.parentNode
-        while (!foundBody) {
-          let parentName
-          if (!parent) parentName = 'body'
-          else parentName = parent.nodeName?.toLowerCase() || parent.name
-          if (parentName === 'loop' || parentName === 'noparse' || parentName === 'noteddy') {
-            next = true
-            break
-          } else if (parentName === 'body') foundBody = true
-          else parent = parent.parent || parent.parentNode
-        }
-        if (next) continue
-        // get conditions
-        let args = []
-        if (browser) el.attribs = getAttribs(el)
-        for (let attr in el.attribs) {
-          if (attr.includes('-teddyduplicate')) attr = attr.split('-teddyduplicate')[0] // the condition is a duplicate, so remove the `-teddyduplicate1` from `conditionName-teddyduplicate1`, `conditionName-teddyduplicate2`, etc
-          let val = el.attribs[attr]
-          if (val) {
-            if (val.startsWith('{')) val = parseVars(val, model)
-            args.push(`${attr}=${val}`)
-          } else args.push(attr)
-        }
-        // check if it's an if tag and not an unless tag
-        let isIf = true
-        const elName = browser ? el.nodeName?.toLowerCase() : el.name
-        if (elName === 'unless') isIf = false
-        // evaluate conditional
-        const condResult = evaluateConditional(args, model)
-        if ((isIf && condResult) || ((!isIf && !condResult))) {
-          // render the true block and discard the elseif, elseunless, and else blocks
-          let nextSibling = el.nextSibling
-          const removeStack = []
-          while (nextSibling) {
-            const nextSiblingName = browser ? nextSibling.nodeName?.toLowerCase() : nextSibling.name
-            switch (nextSiblingName) {
-              case 'elseif':
-              case 'elseunless':
-              case 'else':
-                removeStack.push(nextSibling)
-                nextSibling = nextSibling.nextSibling
-                break
-              case 'if':
-              case 'unless':
-                nextSibling = false
-                break
-              default:
-                nextSibling = nextSibling.nextSibling
-            }
-          }
-          for (const element of removeStack) dom(element).replaceWith('')
-          dom(el).replaceWith(el.childNodes || el.children)
-          parsedTags++
-        } else {
-          // true block is false; find the next elseif, elseunless, or else tag to evaluate
-          let nextSibling = el.nextSibling
-          while (nextSibling) {
-            const nextSiblingName = browser ? nextSibling.nodeName?.toLowerCase() : nextSibling.name
-            switch (nextSiblingName) {
-              case 'elseif':
-                // get conditions
-                args = []
-                if (browser) nextSibling.attribs = getAttribs(nextSibling)
-                for (const attr in nextSibling.attribs) {
-                  const val = nextSibling.attribs[attr]
-                  if (val) args.push(`${attr}=${val}`)
-                  else args.push(attr)
-                }
-                if (evaluateConditional(args, model)) {
-                  // render the true block and discard the elseif, elseunless, and else blocks
-                  const replaceSibling = nextSibling
-                  dom(replaceSibling).replaceWith(replaceSibling.childNodes || replaceSibling.children)
-                  nextSibling = el.nextSibling
-                  const removeStack = []
-                  while (nextSibling) {
-                    const nextSiblingName = browser ? nextSibling.nodeName?.toLowerCase() : nextSibling.name
-                    switch (nextSiblingName) {
-                      case 'elseif':
-                      case 'elseunless':
-                      case 'else':
-                        removeStack.push(nextSibling)
-                        nextSibling = nextSibling.nextSibling
-                        break
-                      case 'if':
-                      case 'unless':
-                        nextSibling = false
-                        break
-                      default:
-                        nextSibling = nextSibling.nextSibling
-                    }
-                  }
-                  for (const element of removeStack) dom(element).replaceWith('')
-                  nextSibling = false
-                  parsedTags++
-                } else {
-                  // true block is false; find the next elseif, elseunless, or else tag to evaluate
-                  const siblingToWipe = nextSibling
-                  nextSibling = nextSibling.nextSibling
-                  dom(siblingToWipe).replaceWith('')
-                }
-                break
-              case 'elseunless':
-                // get conditions
-                args = []
-                if (browser) nextSibling.attribs = getAttribs(nextSibling)
-                for (const attr in nextSibling.attribs) {
-                  const val = nextSibling.attribs[attr]
-                  if (val) args.push(`${attr}=${val}`)
-                  else args.push(attr)
-                }
-                if (!evaluateConditional(args, model)) {
-                  // render the true block and discard the elseif, elseunless, and else blocks
-                  const replaceSibling = nextSibling
-                  dom(replaceSibling).replaceWith(replaceSibling.childNodes || replaceSibling.children)
-                  nextSibling = el.nextSibling
-                  const removeStack = []
-                  while (nextSibling) {
-                    const nextSiblingName = browser ? nextSibling.nodeName?.toLowerCase() : nextSibling.name
-                    switch (nextSiblingName) {
-                      case 'elseif':
-                      case 'elseunless':
-                      case 'else':
-                        removeStack.push(nextSibling)
-                        nextSibling = nextSibling.nextSibling
-                        break
-                      case 'if':
-                      case 'unless':
-                        nextSibling = false
-                        break
-                      default:
-                        nextSibling = nextSibling.nextSibling
-                    }
-                  }
-                  for (const element of removeStack) dom(element).replaceWith('')
-                  nextSibling = false
-                  parsedTags++
-                } else {
-                  // true block is false; find the next elseif, elseunless, or else tag to evaluate
-                  const siblingToWipe = nextSibling
-                  nextSibling = nextSibling.nextSibling
-                  dom(siblingToWipe).replaceWith('')
-                }
-                break
-              case 'else':
-                // else is always true, so if we've gotten here, then there's nothing to evaluate and we've reached the end of the conditional blocks
-                dom(nextSibling).replaceWith(nextSibling.childNodes || nextSibling.children)
-                nextSibling = false
-                parsedTags++
-                break
-              case 'if':
-              case 'unless':
-                // if we encounter another fresh if statement or unless statement, then there's nothing left to evaluate and we've reached the end of this conditional's blocks
-                nextSibling = false
-                break
-              default:
-                // if we encounter any other element or a text node we assume there could still be more elseif, elseunless, or else tags ahead so we keep going
-                nextSibling = nextSibling.nextSibling
-            }
-          }
-          dom(el).replaceWith('') // remove the original if statement once done with finding its siblings
-        }
-      }
-    }
-  } while (parsedTags)
-  return dom
-}
-
 // evaluates a single <if> or <unless> tag
-function evaluateConditional (conditions, model) {
+function evaluateConditional (conditions, model, values) {
   const conditionsLength = conditions.length
   // loop through conditions and reduce them to booleans
   for (let i = 0; i < conditionsLength; i++) {
@@ -460,7 +136,7 @@ function evaluateConditional (conditions, model) {
     }
     // deal with boolean logic
     if (condition === 'and') {
-      if (conditions[i - 1] && evaluateCondition(conditions[i + 1], model)) {
+      if (conditions[i - 1] && evaluateCondition(conditions[i + 1], model, values, i + 1)) {
         // if both sides of an and are true, then reduce all 3 condition blocks to true
         conditions[i - 1] = true
         conditions[i] = true
@@ -472,8 +148,8 @@ function evaluateConditional (conditions, model) {
         conditions[i + 1] = false
       }
     } else if (condition === 'or') {
-      if (conditions[i - 1] || evaluateCondition(conditions[i + 1], model)) {
-        // if either side of an or is true, then reduce all 3 condition blocks to true, as well as all condition blocks that precded this or
+      if (conditions[i - 1] || evaluateCondition(conditions[i + 1], model, values, i + 1)) {
+        // if either side of an or is true, then reduce all 3 condition blocks to true, as well as all condition blocks that preceded this or
         conditions.fill(true, 0, i + 2)
       } else {
         // if both sides of an or are false, then reduce all 3 condition blocks to false
@@ -482,7 +158,7 @@ function evaluateConditional (conditions, model) {
         conditions[i + 1] = false
       }
     } else if (condition === 'xor') {
-      if (!!conditions[i - 1] === !!evaluateCondition(conditions[i + 1], model)) {
+      if (!!conditions[i - 1] === !!evaluateCondition(conditions[i + 1], model, values, i + 1)) {
         // if both sides of an xor are equal to each other, then reduce all 3 condition blocks to false
         conditions[i - 1] = false
         conditions[i] = false
@@ -493,13 +169,25 @@ function evaluateConditional (conditions, model) {
         conditions[i] = true
         conditions[i + 1] = true
       }
-    } else conditions[i] = evaluateCondition(condition, model)
+    } else conditions[i] = evaluateCondition(condition, model, values, i)
   }
   return conditions.every(item => item === true) || false // if any of the booleans are false, then return false. otherwise return true
 }
 
+// the name a condition looks up in the model, or null when it is a boolean operator rather than a condition. this is the same for every render, so a compiled template works it out once and hands the looked up value in rather than having the lookup done again here
+function conditionPath (condition) {
+  if (typeof condition !== 'string') return null
+  if (condition === 'and' || condition === 'or' || condition === 'xor') return null
+  let path = condition.startsWith('not:') ? condition.slice(4) : condition
+  const equals = path.indexOf('=')
+  if (equals !== -1) path = path.slice(0, equals)
+  return path
+}
+
 // determines whether a single condition in a teddy conditional is true or false
-function evaluateCondition (condition, model) {
+//
+// values, when given, holds what each condition looks up already looked up, which is how a compiled template avoids splitting a dotted name apart on every render
+function evaluateCondition (condition, model, values, index) {
   let not // stores whether the :not modifier is present
   if (typeof condition === 'string' && condition.includes('=')) { // it's an equality check condition
     not = !!condition.startsWith('not:') // true if "not:" is present
@@ -508,272 +196,19 @@ function evaluateCondition (condition, model) {
     const cond = parts[0] // something
     delete parts[0] // remove the something=
     const val = parts.join('') // "Some content" — the path.join method ensures the string gets rebuilt even if it contains another = character
-    const lookup = getOrSetObjectByDotNotation(model, cond)
+    const lookup = values ? values[index] : getOrSetObjectByDotNotation(model, cond)
     // the == is necessary because teddy does type-insensitive equality checks
     if (lookup == val) return !not // eslint-disable-line
     else return not // false
   } else { // it's a presence check
     not = typeof condition === 'string' ? !!condition.startsWith('not:') : false // true if "not:" is present
     if (not) condition = condition.slice(4) // remove the :not prefix
-    const lookup = getOrSetObjectByDotNotation(model, condition)
+    const lookup = values ? values[index] : getOrSetObjectByDotNotation(model, condition)
     if (lookup) {
       if (typeof lookup === 'object' && Object.keys(lookup).length === 0) return not // false; empty object or array
       return !not // true; var is present
     } else return not // false; var is not present
   }
-}
-
-// render one-line if attributes, e.g. <p if-something="value" true="class='class-applied-if-true'" false="class='class-applied-if-false'">hello</p>
-function parseOneLineConditionals (dom, model) {
-  let parsedTags
-  do {
-    parsedTags = 0
-    const tags = dom('[true], [false]')
-    if (tags.length > 0) {
-      for (const el of tags) {
-        // skip parsing this if it uses variables as part of its conditions; it will get caught in the next pass after parseVars runs
-        let defer = false
-        if (browser) el.attribs = getAttribs(el)
-        for (const attr in el.attribs) {
-          const val = el.attribs[attr]
-          if (val.startsWith('{')) {
-            defer = true
-            break
-          }
-        }
-        if (defer) {
-          dom(el).attr('teddydeferredonelineconditional', 'true')
-          continue
-        }
-        // ensure this isn't the child of a loop or a no parse block
-        let foundBody = false
-        let next = false
-        let parent = el.parent || el.parentNode
-        while (!foundBody) {
-          let parentName
-          if (!parent) parentName = 'body'
-          else parentName = parent.nodeName?.toLowerCase() || parent.name
-          if (parentName === 'loop' || parentName === 'noparse' || parentName === 'noteddy') {
-            next = true
-            break
-          } else if (parentName === 'body') foundBody = true
-          else parent = parent.parent || parent.parentNode
-        }
-        if (next) continue
-        // get conditions
-        //
-        // an element can carry a sequence of one line conditionals rather than only one: a condition, any further conditions joined to it by and, or, or xor, then the true and false outcomes for that condition, and then possibly another condition beginning the next one in the sequence
-        //
-        // the outcomes are what separate one from the next, so a condition that turns up after an outcome has already been given starts a new conditional, while one that turns up before that is part of the condition being built
-        if (browser) el.attribs = getAttribs(el)
-        const conditionals = []
-        let conditional = null
-        let lastWasCondition = false
-        let lastWasJoiner = false
-        for (const origAttr in el.attribs) {
-          let attr = origAttr
-          let val = el.attribs[attr]
-          if (attr.includes('-teddyduplicate')) attr = attr.split('-teddyduplicate')[0] // the condition is a duplicate, so remove the `-teddyduplicate1` from `conditionName-teddyduplicate1`, `conditionName-teddyduplicate2`, etc
-          if (val?.startsWith('{')) val = parseVars(val, model)
-          if (attr.startsWith('if-')) {
-            if (lastWasCondition && !lastWasJoiner && params.verbosity > 1) console.warn(`teddy encountered a one line conditional that begins another condition before saying what to do with the previous one: ${origAttr}`)
-            if (!conditional || conditional.ifTrue !== undefined || conditional.ifFalse !== undefined) {
-              // an outcome has already been given, so this condition belongs to the next conditional rather than this one
-              conditional = { args: [], ifTrue: undefined, ifFalse: undefined }
-              conditionals.push(conditional)
-            }
-            const parts = attr.split('if-')
-            if (val) conditional.args.push(`${parts[1]}=${val}`)
-            else conditional.args.push(parts[1])
-            dom(el).removeAttr(origAttr)
-            lastWasCondition = true
-            lastWasJoiner = false
-          } else if (attr === 'true' || attr === 'false') {
-            if (conditional) conditional[attr === 'true' ? 'ifTrue' : 'ifFalse'] = val.replaceAll('&quot;', '"') // true="class='blah'"
-            dom(el).removeAttr(origAttr)
-            lastWasCondition = false
-            lastWasJoiner = false
-          } else if (attr === 'and' || attr === 'or' || attr === 'xor') {
-            if (conditional) conditional.args.push(attr)
-            dom(el).removeAttr(origAttr)
-            lastWasJoiner = true
-          }
-        }
-        // evaluate each conditional in the sequence and apply whichever outcome it calls for
-        for (const item of conditionals) {
-          const outcome = evaluateConditional(item.args, model) ? item.ifTrue : item.ifFalse
-          if (outcome) {
-            const parts = outcome.split('=')
-            dom(el).attr(parts[0], parts[1] ? parts[1].replace(/["']/g, '') : '')
-          }
-          parsedTags++
-        }
-      }
-    }
-  } while (parsedTags)
-  return dom
-}
-
-// render <loop> tags
-function parseLoops (dom, model) {
-  let parsedTags
-  do {
-    parsedTags = 0
-    const tags = dom('loop')
-    if (tags.length > 0) {
-      for (const el of tags) {
-        // get attributes
-        let loopThrough
-        let keyName
-        let valName
-        if (browser) el.attribs = getAttribs(el)
-        for (const attr in el.attribs) {
-          if (attr === 'through') {
-            let attrVal = el.attribs[attr]
-            if (attrVal.startsWith('{')) attrVal = parseVars(attrVal, model)
-            loopThrough = getOrSetObjectByDotNotation(model, attrVal)
-          } else if (attr === 'key') keyName = el.attribs[attr]
-          else if (attr === 'val') valName = el.attribs[attr]
-        }
-        // reject the loop if it has invalid attributes
-        if (!loopThrough) {
-          if (params.verbosity > 1) console.warn('teddy encountered a loop without a through attribute.')
-          dom(el).replaceWith('')
-          continue
-        }
-        if (!keyName && !valName) {
-          if (params.verbosity > 1) console.warn('teddy encountered a loop without a key or a val attribute.')
-          dom(el).replaceWith('')
-          continue
-        }
-        // loop through model[loopThrough] and parse teddy tags within the loop's iteration against the local model
-        let newMarkup = ''
-        let loopContents = dom(el).html()
-        if (loopThrough instanceof Set) loopThrough = [...loopThrough] // convert Sets to arrays
-        for (const key in loopThrough) {
-          const val = loopThrough[key]
-          const localModel = Object.assign({}, model)
-          getOrSetObjectByDotNotation(localModel, keyName, key)
-          getOrSetObjectByDotNotation(localModel, valName, val)
-          const hasNoteddyLoopContents = loopContents.includes('</noteddy>')
-          const hasNoparseLoopContents = loopContents.includes('</noparse>')
-          const hasPreLoopContents = loopContents.includes('</pre>')
-          if (hasNoteddyLoopContents || hasNoparseLoopContents || hasPreLoopContents) {
-            let localDom = cheerioLoad(loopContents, cheerioOptions)
-            localDom = tagNoParseBlocks(localDom, localModel)
-            loopContents = localDom.html()
-          }
-          const localMarkup = parseVars(loopContents, localModel) || ''
-          const hasNoteddy = localMarkup.includes('</noteddy>')
-          const hasNoparse = localMarkup.includes('</noparse>')
-          const hasIf = localMarkup.includes('</if>')
-          const hasUnless = localMarkup.includes('</unless>')
-          const hasTrue = localMarkup.includes(' true=')
-          const hasFalse = localMarkup.includes(' false=')
-          const hasInclude = localMarkup.includes('</include>')
-          const hasLoop = localMarkup.includes('</loop>')
-          const hasInline = localMarkup.includes('</inline>')
-          const hasSelected = localMarkup.includes(' selected-value=') || localMarkup.includes(' checked-value=')
-          const iterationNeedsDom = browser || hasNoteddy || hasNoparse || hasIf || hasUnless || hasTrue || hasFalse || hasInclude || hasLoop || hasInline || hasSelected // only use the DOM parser when it is actually needed
-          if (iterationNeedsDom) {
-            let localDom = cheerioLoad(localMarkup || '', cheerioOptions)
-            if (hasNoteddy || hasNoparse) localDom = tagNoParseBlocks(localDom, localModel)
-            if (hasIf || hasUnless) localDom = parseConditionals(localDom, localModel)
-            if (hasTrue || hasFalse) localDom = parseOneLineConditionals(localDom, localModel)
-            // the same order the main render pass uses: an include is expanded before the loops around it, and the partial it pulls in is parsed against this iteration's model, so a partial can branch on the loop's val the way it can in other templating engines
-            if (hasInclude) localDom = parseIncludes(localDom, localModel)
-            if (hasLoop) localDom = parseLoops(localDom, localModel)
-            if (hasInline) localDom = parseInlines(localDom, localModel)
-            if (hasSelected) localDom = parseSelectedAttributeValues(localDom, localModel)
-            newMarkup += localDom.html()
-          } else newMarkup += localMarkup
-        }
-        // the loop output goes in as one raw node rather than as markup for cheerio to parse
-        //
-        // cheerio parses whatever markup it is handed and splices the elements in one at a time, at a cost growing with the square of the output. in one benchmark done at the time of writing, 8000 rows spent over 400ms being spliced into a document it is about to be serialized straight back out of again
-        //
-        // teddy asks cheerio not to touch entities, so a raw node comes back out exactly as it went in
-        //
-        // a raw node is invisible to a selector, so anything the steps after this one still have to find goes in as real markup instead: an <option> a select's selected-value has to match, an <inline>, a <cache>, or a block whose contents are exempt from parsing
-        const stillNeedsFinding = /<(option|inline|cache|noteddy|noparse|pre)[\s>]/i.test(newMarkup)
-        if (browser || stillNeedsFinding) dom(el).replaceWith(newMarkup || '')
-        else dom(el).replaceWith({ type: 'text', data: newMarkup || '' })
-        parsedTags++
-      }
-    }
-  } while (parsedTags)
-  return dom
-}
-
-// render <inline> tags
-function parseInlines (dom, model) {
-  let parsedTags
-  do {
-    parsedTags = 0
-    const tags = dom('inline')
-    if (tags.length > 0) {
-      for (const el of tags) {
-        // get attributes
-        let css
-        let js
-        if (browser) el.attribs = getAttribs(el)
-        for (const attr in el.attribs) {
-          if (attr === 'css') css = getOrSetObjectByDotNotation(model, el.attribs[attr])
-          else if (attr === 'js') js = getOrSetObjectByDotNotation(model, el.attribs[attr])
-        }
-        // reject if it has invalid attributes
-        if (!css && !js) {
-          if (params.verbosity > 1) console.warn('teddy encountered an <inline> element without a css or js attribute.')
-          dom(el).replaceWith('')
-          continue
-        }
-        let replaceWith = ''
-        if (css) replaceWith = `<style>${css}</style>`
-        else replaceWith = `<script>${js}</script>`
-        dom(el).replaceWith(replaceWith)
-        parsedTags++
-      }
-    }
-  } while (parsedTags)
-  return dom
-}
-
-// render `selected-value` and `checked-value` attributes
-function parseSelectedAttributeValues (dom, model) {
-  let parsedTags
-  do {
-    parsedTags = 0
-    const tags = dom('select[selected-value], [checked-value]')
-    if (tags.length > 0) {
-      for (const el of tags) {
-        // get attributes
-        if (browser) el.attribs = getAttribs(el)
-        for (let attr in el.attribs) {
-          const origAttr = attr
-          if (attr.includes('-teddyduplicate')) attr = attr.split('-teddyduplicate')[0]
-          if (attr === 'selected-value') {
-            const val = parseVars(el.attribs[origAttr], model) || el.attribs[origAttr]
-            const children = dom(el).find('option[value]')
-            for (const opt of children) {
-              if (browser) opt.attribs = getAttribs(opt)
-              if (opt.attribs.value === val) dom(opt).attr('selected', 'selected')
-            }
-            dom(el).removeAttr(origAttr)
-          } else if (attr === 'checked-value') {
-            const val = parseVars(el.attribs[origAttr], model) || el.attribs[origAttr]
-            const children = dom(el).find('input[type="checkbox"][value], input[type="radio"][value]')
-            for (const opt of children) {
-              if (browser) opt.attribs = getAttribs(opt)
-              if (opt.attribs.value === val) dom(opt).attr('checked', 'checked')
-            }
-            dom(el).removeAttr(origAttr)
-          }
-        }
-        parsedTags++
-      }
-    }
-  } while (parsedTags)
-  return dom
 }
 
 // render {variables}
@@ -796,134 +231,86 @@ function parseVars (templateString, model) {
       const originalMatch = match
       match = parseVars(match, model)
       try {
-        templateString = templateString.replace(varPattern(`\${${originalMatch}}`, false), () => `\${${match}}`)
-        templateString = templateString.replace(varPattern(`{${originalMatch}}`, false), () => `{${match}}`)
+        templateString = templateString.replace(varPattern(`\${${originalMatch}}`, true), () => `\${${match}}`)
+        templateString = templateString.replace(varPattern(`{${originalMatch}}`, true), () => `{${match}}`)
       } catch (e) {
         if (params.verbosity > 2) console.warn(`teddy.parseVars encountered a {variable} that could not be parsed: {${originalMatch}}`)
       }
     }
-    const lastSixChars = match.slice(-6)
-    if (lastSixChars.includes('|p')) { // no parse flag is set
-      const originalMatch = match
-      match = match.substring(0, match.length - (lastSixChars.split('|').length - 1) * 2) // remove last 2-n chars
-      let parsed = getOrSetObjectByDotNotation(model, match)
-      if (!parsed && !lastSixChars.includes('|d') && (params.emptyVarBehavior === 'hide' || lastSixChars.includes('|h'))) parsed = '' // display empty string instead of the variable text verbatim if this setting is set
-      if (typeof parsed === 'string' && parsed.startsWith('{') && parsed.includes('|d')) parsed = parsed.replace('|d', '')
-      if (parsed || parsed === '') {
-        const id = model._noTeddyBlocks.push(parsed) - 1
-        try {
-          try {
-            templateString = templateString.replace(varPattern(`\${${originalMatch}}`, true), `<noteddy id="${id}"></noteddy>`)
-            templateString = templateString.replace(varPattern(`{${originalMatch}}`, true), `<noteddy id="${id}"></noteddy>`)
-          } catch (e) {
-            if (params.verbosity > 2) console.warn(`teddy.parseVars encountered a {variable} that could not be parsed: {${originalMatch}}`)
-          }
-        } catch (e) {
-          return templateString
-        }
-      }
-    } else if (lastSixChars.includes('|s')) { // no escape flag is set
-      const originalMatch = match
-      match = match.substring(0, match.length - (lastSixChars.split('|').length - 1) * 2) // remove last 2-n chars
-      let parsed = getOrSetObjectByDotNotation(model, match)
-      let skipTemplateLiteralReplacement = false
-      if (!parsed && !lastSixChars.includes('|d') && (params.emptyVarBehavior === 'hide' || lastSixChars.includes('|h'))) parsed = '' // display empty string instead of the variable text verbatim if this setting is set
-      else if (!parsed && parsed !== '') {
-        skipTemplateLiteralReplacement = true
-        parsed = `{${originalMatch}}`
-      }
-      if (typeof parsed === 'string' && parsed.startsWith('{') && parsed.includes('|d')) parsed = parsed.replace('|d', '')
-      try {
-        if (!skipTemplateLiteralReplacement) templateString = templateString.replace(varPattern(`\${${originalMatch}}`, true), () => parsed)
-        templateString = templateString.replace(varPattern(`{${originalMatch}}`, true), () => parsed)
-      } catch (e) {
-        return templateString
-      }
-    } else { // no flags are set
-      let parsed = getOrSetObjectByDotNotation(model, match)
-      let skipTemplateLiteralReplacement = false
-      if (!parsed && !lastSixChars.includes('|d') && (params.emptyVarBehavior === 'hide' || lastSixChars.includes('|h'))) parsed = '' // display empty string instead of the variable text verbatim if this setting is set
-      else if (parsed || parsed === '') parsed = escapeEntities(parsed)
-      else if (parsed === 0) parsed = '0'
-      else {
-        skipTemplateLiteralReplacement = true
-        parsed = `{${match}}`
-      }
-      if (typeof parsed === 'string' && parsed.startsWith('{') && parsed.includes('|d')) parsed = parsed.replace('|d', '')
-      try {
-        if (!skipTemplateLiteralReplacement) templateString = templateString.replace(varPattern(`\${${match}}`, true), () => parsed)
-        templateString = templateString.replace(varPattern(`{${match}}`, true), () => parsed)
-      } catch (e) {
-        return templateString
-      }
+    const resolved = resolveVariable(match, model)
+    if (!resolved) continue // the variable resolves to nothing that should be written, so it is left in the markup verbatim
+    const { name, text, skipTemplateLiteralReplacement } = resolved
+    try {
+      if (!skipTemplateLiteralReplacement) templateString = templateString.replace(varPattern(`\${${name}}`, true), () => text)
+      templateString = templateString.replace(varPattern(`{${name}}`, true), () => text)
+    } catch (e) {
+      return templateString
     }
   }
   return templateString
 }
 
-// once the template is fully rendered, find all cache elements that still exist and cache their contents
-function defineNewCaches (dom, model) {
-  let parsedTags
-  do {
-    parsedTags = 0
-    const tags = dom('cache[defer]')
-    if (tags.length > 0) {
-      for (const el of tags) {
-        if (browser) el.attribs = getAttribs(el)
-        const name = el.attribs.name
-        const key = el.attribs.key || 'none'
-        const maxAge = parseInt(el.attribs.maxAge || el.attribs.maxage) || 0
-        const maxCaches = parseInt(el.attribs.maxCaches || el.attribs.maxcaches) || 1000
-        const timestamp = Date.now()
-        const markup = dom(el).html()
-        if (!caches[name]) {
-          caches[name] = {
-            key,
-            maxAge,
-            maxCaches,
-            entries: {}
-          }
-        }
-        caches[name].entries[el.attribs.key ? getOrSetObjectByDotNotation(model, key) : 'none'] = {
-          lastAccessed: timestamp,
-          created: timestamp,
-          markup
-        }
-        // invalidate oldest cache if we've reached max caches limit
-        if (Object.keys(caches[name].entries).length > maxCaches) {
-          const lowestKeyVal = Object.keys(caches[name].entries).reduce((a, b) => caches[name].entries[a].lastAccessed < caches[name].entries[b].lastAccessed ? a : b)
-          delete caches[name].entries[lowestKeyVal]
-        }
-        dom(el).replaceWith(markup)
-        parsedTags++
-      }
-    }
-  } while (parsedTags)
-  return dom
+// works out what a single {variable} should be replaced with, given its name and any flags on it
+//
+// this is shared by the interpreter above and by the compiler, which walks a template once and keeps a slot for every variable rather than rescanning the markup for it. the rules it implements are not obvious: a value of false or null resolves to the variable's own text, 0 writes as "0" when escaped but resolves to its own text when raw, an object writes as [Object] when escaped and as its own toString when raw, and |h blanks all of them. having one implementation of that is the only way the two paths can be relied on to agree
+//
+// returns null when nothing should be substituted, or { name, text, skipTemplateLiteralReplacement } where name is the variable without its flags and text is what to write
+function resolveVariable (match, model) {
+  const flags = variableFlags(match)
+  return formatVariable(flags, getOrSetObjectByDotNotation(model, flags.name), model)
 }
 
-// removes any remaining teddy tags from the dom before returning the parsed html to the user
-function cleanupStrayTeddyTags (dom) {
-  let parsedTags
-  do {
-    parsedTags = 0
-    const tags = dom('[teddydeferredonelineconditional], pre[parse], include, arg, if, unless, elseif, elseunless, else, loop, cache')
-    if (tags.length > 0) {
-      for (const el of tags) {
-        const tagName = browser ? el.nodeName?.toLowerCase() : el.name
-        if (tagName === 'include' || tagName === 'arg' || tagName === 'if' || tagName === 'unless' || tagName === 'elseif' || tagName === 'elseunless' || tagName === 'else' || tagName === 'loop' || tagName === 'cache') {
-          dom(el).remove()
-        }
-        if (browser) el.attribs = getAttribs(el)
-        for (const attr in el.attribs) {
-          if (attr === 'true' || attr === 'false' || attr === 'parse' || attr === 'teddydeferredonelineconditional' || attr.startsWith('if-')) {
-            dom(el).removeAttr(attr)
-          }
-        }
-      }
+// which flags a {variable} carries and what its name is without them, worked out from the name alone. this is the same for every render of a template, so a compiled template settles it once rather than reading the last x characters of the name on every render
+function variableFlags (match) {
+  const lastSixChars = match.slice(-6)
+  const flagCount = lastSixChars.split('|').length - 1
+  const noparse = lastSixChars.includes('|p')
+  const raw = !noparse && lastSixChars.includes('|s')
+  return {
+    match,
+    name: noparse || raw ? match.substring(0, match.length - flagCount * 2) : match,
+    noparse,
+    raw,
+    hide: lastSixChars.includes('|h'),
+    display: lastSixChars.includes('|d')
+  }
+}
+
+// what a variable writes, given its flags and the value the model had for it
+//
+// the rules here are not obvious: a value of false or null resolves to the variable's own text, 0 writes as "0" when escaped but resolves to its own text when raw, an object writes as [Object] when escaped and as its own toString when raw, and |h blanks all of them. this is the one place they are implemented, so every caller agrees about them
+//
+// returns null when nothing should be substituted, or { name, text, skipTemplateLiteralReplacement } where name is the variable as written and text is what to write
+function formatVariable (flags, value, model) {
+  const { match, noparse, raw, hide, display } = flags
+  let parsed = value
+
+  if (noparse) {
+    if (!parsed && !display && (params.emptyVarBehavior === 'hide' || hide)) parsed = '' // display empty string instead of the variable text verbatim if this setting is set
+    if (typeof parsed === 'string' && parsed.startsWith('{') && parsed.includes('|d')) parsed = parsed.replace('|d', '')
+    if (!parsed && parsed !== '') return null
+    const id = model._noTeddyBlocks.push(parsed) - 1
+    return { name: match, text: `<noteddy id="${id}"></noteddy>`, skipTemplateLiteralReplacement: false }
+  }
+
+  let skipTemplateLiteralReplacement = false
+  if (raw) {
+    if (!parsed && !display && (params.emptyVarBehavior === 'hide' || hide)) parsed = '' // display empty string instead of the variable text verbatim if this setting is set
+    else if (!parsed && parsed !== '') {
+      skipTemplateLiteralReplacement = true
+      parsed = `{${match}}`
     }
-  } while (parsedTags)
-  return dom
+  } else {
+    if (!parsed && !display && (params.emptyVarBehavior === 'hide' || hide)) parsed = '' // display empty string instead of the variable text verbatim if this setting is set
+    else if (parsed || parsed === '') parsed = escapeEntities(parsed)
+    else if (parsed === 0) parsed = '0'
+    else {
+      skipTemplateLiteralReplacement = true
+      parsed = `{${match}}`
+    }
+  }
+  if (typeof parsed === 'string' && parsed.startsWith('{') && parsed.includes('|d')) parsed = parsed.replace('|d', '')
+  return { name: match, text: parsed, skipTemplateLiteralReplacement }
 }
 
 // escapes sensitive characters to prevent xss
@@ -934,45 +321,36 @@ const escapeHtmlEntities = {
   '"': '&#34;',
   "'": '&#39;'
 }
-const entityKeys = Object.keys(escapeHtmlEntities)
-const ekl = entityKeys.length
-const needsEscaping = /[&<>"']/ // most values have nothing in them that needs escaping, and finding that out with one scan costs far less than rebuilding the whole value a character at a time to arrive at the same string; this is deliberately not a replace: for a value that is dense with entities, the loop below is faster than a regex is
-function escapeEntities (value) {
-  let escapedEntity = false
-  let newValue = ''
-  let i
-  let j
+// the same replacements again, indexed by character code, so that finding one costs no comparisons and builds no single character string to compare against
+const escapeHtmlEntitiesByCode = []
+for (const character of Object.keys(escapeHtmlEntities)) escapeHtmlEntitiesByCode[character.charCodeAt(0)] = escapeHtmlEntities[character]
 
+const needsEscaping = /[&<>"']/g // most values have nothing in them that needs escaping, and one scan settles that
+function escapeEntities (value) {
   if (typeof value === 'object') { // cannot escape on this value
-    if (!value) return false // it is falsey to return false
+    if (!value) return false // it is falsy to return false
     else if (Array.isArray(value)) {
-      if (value.length === 0) return false // empty arrays are falsey
+      if (value.length === 0) return false // empty arrays are falsy
       else return '[Array]' // print that it is an array with content in it, but do not print the contents
     }
     return '[Object]' // just print that it is an object, do not print the contents
-  } else if (value === undefined) return false // cannot escape on this value; undefined is falsey
+  } else if (value === undefined) return false // cannot escape on this value; undefined is falsy
   else if (typeof value === 'boolean' || typeof value === 'number') return value // cannot escape on these values; if it's already a boolean or a number just return it
-  else {
-    if (!needsEscaping.test(value)) return value // nothing to escape, so the value is already what the loop below would build
 
-    // loop through value to find html entities
-    for (i = 0; i < value.length; i++) {
-      escapedEntity = false
+  // the regular expression engine finds the entities, which it does far faster than stepping through the value in javascript, and the stretches between them are copied a piece at a time rather than a character at a time. one pass over the value either way, and a value with nothing to escape is returned as it came in
+  needsEscaping.lastIndex = 0
+  let match = needsEscaping.exec(value)
+  if (match === null) return value
 
-      // loop through list of html entities to escape
-      for (j = 0; j < ekl; j++) {
-        if (value[i] === entityKeys[j]) { // alter value to show escaped html entities
-          newValue += escapeHtmlEntities[entityKeys[j]]
-          escapedEntity = true
-          break
-        }
-      }
+  let escaped = ''
+  let copiedTo = 0
+  do {
+    escaped += value.slice(copiedTo, match.index) + escapeHtmlEntitiesByCode[value.charCodeAt(match.index)]
+    copiedTo = match.index + 1
+    match = needsEscaping.exec(value)
+  } while (match !== null)
 
-      if (!escapedEntity) newValue += value[i]
-    }
-  }
-
-  return newValue
+  return escaped + value.slice(copiedTo)
 }
 
 // if an entity is double-encoded, this will fix that
@@ -1054,8 +432,16 @@ function getOrSetObjectByDotNotation (obj, dotNotation, value) {
   if (!dotNotation || typeof dotNotation === 'boolean' || typeof dotNotation === 'number') return dotNotation
   if (typeof dotNotation === 'string') return getOrSetObjectByDotNotation(obj, dotNotation.split('.'), value)
   else if (dotNotation.length === 1 && value !== undefined) {
-    obj[dotNotation[0]] = value
-    return obj[dotNotation[0]]
+    // a lookup is case insensitive, so a key that differs from this one only in case has to go: leaving both in place means which one a later lookup finds depends on the order the keys happen to be in. this matters most for <include> <arg> names, because the browser lowercases attribute names and cheerio does not, so an <arg camelCase> would otherwise sit next to a model key of the same name in a different case
+    const key = dotNotation[0]
+    if (!Object.prototype.hasOwnProperty.call(obj, key)) {
+      const lowerCaseKey = key.toLowerCase()
+      for (const existing in obj) {
+        if (existing !== key && existing.toLowerCase() === lowerCaseKey) delete obj[existing]
+      }
+    }
+    obj[key] = value
+    return obj[key]
   } else if (dotNotation.length === 0) return obj
   else if (dotNotation.length === 1) {
     if (obj) return caseInsensitiveLookup(obj, dotNotation[0])
@@ -1063,6 +449,8 @@ function getOrSetObjectByDotNotation (obj, dotNotation, value) {
   } else return getOrSetObjectByDotNotation(caseInsensitiveLookup(obj, dotNotation[0]), dotNotation.slice(1), value)
   function caseInsensitiveLookup (obj, key) {
     if (key === 'length') return obj.length
+    // a key that matches exactly is the overwhelming case, and answering it costs one lookup. the lowercased copy of the object below is only built when there is no exact match to be had, which is what stops a model lookup from costing as much as the object is wide on every single step of every single path
+    if (Object.prototype.hasOwnProperty.call(obj, key)) return obj[key]
     const lowerCaseKey = key.toLowerCase()
     const normalizedObj = Object.keys(obj).reduce((acc, k) => {
       acc[k.toLowerCase()] = obj[k]
@@ -1091,7 +479,6 @@ function getAttribs (element) {
 function setDefaultParams () {
   params.verbosity = 1
   params.templateRoot = './'
-  params.maxPasses = 1000
   params.emptyVarBehavior = 'display' // or 'hide'
   params.includeNotFoundBehavior = 'display' // or 'hide'
   params.cacheTemplates = false // whether to keep templates read from the filesystem in memory rather than reading them again on the next render
@@ -1122,11 +509,6 @@ function setVerbosity (v) {
 // mutator method to set template root param; must be a string
 function setTemplateRoot (v) {
   params.templateRoot = String(v)
-}
-
-// mutator method to set max passes param: the number of times the parser can iterate over the template
-function setMaxPasses (v) {
-  params.maxPasses = Number(v)
 }
 
 // mutator method to set empty var behavior param: whether to display {variables} that don't resolve as text ('display') or as an empty string ('hide')
@@ -1161,15 +543,78 @@ function compile (templateString) {
   }
 }
 
+const compiler = createCompiler({
+  cheerioLoad,
+  cheerioOptions,
+  browser,
+  params,
+  variableFlags,
+  formatVariable,
+  escapeEntities,
+  conditionPath,
+  evaluateConditional,
+  loadTemplate,
+  caches,
+  parseVars,
+  getAttribs,
+  getOrSetObjectByDotNotation
+})
+
+// everything about a template that does not depend on the model: its markup with repeated attributes renamed, and the node tree the compiler built from it
+//
+// nodes is null for a template the compiler does not handle, and that answer is kept too, so a template it has already turned down is not walked again on every render only to be turned down again
+//
+// keyIsMarkup says the key is the template's own markup rather than a name it was looked up by. such an entry can never go stale, because the key is the content, so it is always kept: that is what makes teddy.compile() compile once even in development. an entry keyed by a name can go stale, since the file behind the name may change, so it is kept only on the same terms as the template source itself
+function prepareTemplate (cacheKey, markup, keyIsMarkup) {
+  const keep = keyIsMarkup || params.cacheTemplates
+  // give every repeated attribute name a unique one before the markup is parsed since html parsers strip duplicate attributes
+  const prepared = markup.replace(/<([a-zA-Z][a-zA-Z0-9-]*)([^>]*)>/g, (match, tagName, attributes) => {
+    const attrRegex = /([a-zA-Z0-9-:._]+)(?:=(["'])(.*?)\2|([^>\s]+))?/g
+    const attrMap = new Map()
+    let count = 1
+    const processedAttributes = attributes.replace(attrRegex, (attrMatch, attrName, quote, attrValue) => {
+      if (attrMap.has(attrName)) {
+        const newAttrName = `${attrName}-teddyduplicate${count++}`
+        return attrMatch.replace(attrName, newAttrName)
+      } else {
+        attrMap.set(attrName, true)
+        return attrMatch
+      }
+    })
+    return `<${tagName}${processedAttributes}>`
+  })
+  const nodes = compiler.compileTemplate(prepared)
+  // emitting javascript is faster than walking the tree, and needs to build a function from a string to do it, which a page under a strict content security policy may not do. browser builds therefore walk the tree, and so does any template holding a construct the emitter does not write code for
+  let render = null
+  if (canEmit(nodes)) {
+    try {
+      render = emit(nodes, compiler.helpers).render
+    } catch (err) {
+      if (params.verbosity > 1) console.warn(`teddy: could not emit javascript for this template, so it will be rendered by walking it instead: ${err.message}`)
+      render = null
+    }
+  }
+  const entry = { markup: prepared, nodes, render, keyIsMarkup }
+  if (keep) {
+    if (compiledCache.size > maxCompiledCache) compiledCache = new Map()
+    compiledCache.set(cacheKey, entry)
+  }
+  return entry
+}
+
 // mutator method to cache template
 function setTemplate (file, template) {
   templates[file] = template
+  // whatever was compiled under this name was compiled from the old markup
+  compiledCache.delete(file)
+  compiledCache.delete(file.slice(-5) === '.html' ? file.substring(0, file.length - 5) : file + '.html')
 }
 
 // mutator method to clear template cache entirely
 function clearTemplates () {
   templates = {}
   fileCache = {}
+  compiledCache = new Map()
 }
 
 function setCache (params) {
@@ -1220,7 +665,6 @@ function render (template, model, callback) {
   }
 
   // declare vars
-  let dom
   let renderedTemplate
   model._noTeddyBlocks = [] // will store code blocks exempt from teddy parsing
 
@@ -1242,136 +686,55 @@ function render (template, model, callback) {
   if (templateCache) {
     const singletonCache = templateCache.none
     if (singletonCache) {
-      // check if the timestamp exceeds max age
+      // an entry with no max age set never goes stale
       if (!singletonCache.created) cacheKey = 'none'
-      else if (!singletonCache.maxAge && singletonCache.maxage) {
-        // if no max age is set, then this cache doesn't expire
-        if (typeof callback === 'function') return callback(null, singletonCache.markup)
-        else return singletonCache.markup
-      } else if (singletonCache.created + (singletonCache.maxAge || singletonCache.maxage) < Date.now()) cacheKey = 'none' // if yes re-render the template and cache it again
+      else if (singletonCache.maxAge && singletonCache.created + singletonCache.maxAge < Date.now()) cacheKey = 'none' // it has gone stale, so render it again and keep the new markup
       else {
-        // if no return the cached markup and skip the template render
         if (typeof callback === 'function') return callback(null, singletonCache.markup)
         else return singletonCache.markup
       }
     } else {
-      // loop through its keys
       for (const key in templateCache) {
-        // if there's a model value for that key name
-        cacheKeyModelVal = getOrSetObjectByDotNotation(model, key)
-        if (cacheKeyModelVal) {
-          // loop through its entries
-          const templateCacheAtThisKey = templateCache[key]
-          for (const entryKey in templateCacheAtThisKey.entries) {
-            // if any entry keys match the model value for that key name
-            if (entryKey === cacheKeyModelVal) {
-              // check if the timestamp exceeds max age
-              const entry = templateCacheAtThisKey.entries[entryKey]
-              if (!templateCacheAtThisKey.maxAge && !templateCacheAtThisKey.maxage) {
-                // if no max age is set, then this cache doesn't expire
-                if (typeof callback === 'function') return callback(null, entry.markup)
-                else return entry.markup
-              } else if (entry.created + (templateCacheAtThisKey.maxAge || templateCacheAtThisKey.maxage) < Date.now()) {
-                // if yes re-render the template and cache it again
-                cacheKey = key
-                break
-              } else {
-                // if no return the cached markup and skip the template render
-                if (typeof callback === 'function') return callback(null, entry.markup)
-                else return entry.markup
-              }
-            }
-          }
-          // this is a new model value so it needs a new entry
-          cacheKey = key
-          break
+        const modelVal = getOrSetObjectByDotNotation(model, key)
+        // the model says nothing about this key, so this render is not cached under it. saying zero, or an empty string, is still saying something
+        if (modelVal === false || modelVal === null || modelVal === undefined) continue
+
+        // the value names an entry, and the name of anything is a string: a number used as one becomes its own digits, so it has to be read back the same way it was written. searching the entries for it instead would cost as much as the cache is wide, and would never match a value that was not a string to begin with
+        cacheKeyModelVal = String(modelVal)
+        const templateCacheAtThisKey = templateCache[key]
+        const entry = templateCacheAtThisKey.entries[cacheKeyModelVal]
+        const maxAge = templateCacheAtThisKey.maxAge
+
+        // an entry with no max age set never goes stale
+        if (entry && (!maxAge || entry.created + maxAge >= Date.now())) {
+          if (typeof callback === 'function') return callback(null, entry.markup)
+          else return entry.markup
         }
+
+        // either nothing is cached for this value yet or what was there has gone stale
+        cacheKey = key
+        break
       }
     }
   }
 
-  // start the render
-  renderedTemplate = loadTemplate(template)
-
-  // a name that resolves to nothing falls back to being rendered as though it were markup
-  if (renderedTemplate === null) renderedTemplate = template.slice(-5) === '.html' ? template.substring(0, template.length - 5) : template
-
-  // give every repeated attribute name a unique one before the markup is parsed since html parsers strip duplicate attributes
-  renderedTemplate = renderedTemplate.replace(/<([a-zA-Z][a-zA-Z0-9-]*)([^>]*)>/g, (match, tagName, attributes) => {
-    const attrRegex = /([a-zA-Z0-9-:._]+)(?:=(["'])(.*?)\2|([^>\s]+))?/g
-    const attrMap = new Map()
-    let count = 1
-    const processedAttributes = attributes.replace(attrRegex, (attrMatch, attrName, quote, attrValue) => {
-      if (attrMap.has(attrName)) {
-        const newAttrName = `${attrName}-teddyduplicate${count++}`
-        return attrMatch.replace(attrName, newAttrName)
-      } else {
-        attrMap.set(attrName, true)
-        return attrMatch
-      }
-    })
-    return `<${tagName}${processedAttributes}>`
-  })
-
-  dom = cheerioLoad(renderedTemplate || '', cheerioOptions)
-  let oldTemplate
-  let passes = 0
-  let parseDynamicIncludes = false
-  do {
-    passes++
-    if (passes > params.maxPasses) {
-      if (params.verbosity > 0) console.error(`teddy could not finish rendering the template because the max number of passes over the template (${params.maxPasses}) was exceeded; there may be an infinite loop in your template logic.`)
-      break
-    }
-    const hasCache = renderedTemplate.includes('</cache>')
-    const hasNoteddy = renderedTemplate.includes('</noteddy>')
-    const hasNoparse = renderedTemplate.includes('</noparse>')
-    const hasPre = renderedTemplate.includes('</pre>')
-    const hasIf = renderedTemplate.includes('</if>')
-    const hasUnless = renderedTemplate.includes('</unless>')
-    const hasTrue = renderedTemplate.includes(' true=')
-    const hasFalse = renderedTemplate.includes(' false=')
-    const hasInclude = renderedTemplate.includes('</include>')
-    const hasLoop = renderedTemplate.includes('</loop>')
-    const hasInline = renderedTemplate.includes('</inline>')
-    const hasSelected = renderedTemplate.includes(' selected-value=') || renderedTemplate.includes(' checked-value=')
-    oldTemplate = renderedTemplate || ''
-    if (passes > 1) {
-      dom = cheerioLoad(renderedTemplate || '', cheerioOptions)
-      if (parseDynamicIncludes) dom = parseIncludes(dom, model, true)
-    }
-    if (hasCache) dom = replaceCacheElements(dom, model)
-    if (hasNoteddy || hasNoparse || hasPre) dom = tagNoParseBlocks(dom, model)
-    if (hasIf || hasUnless) dom = parseConditionals(dom, model)
-    if (hasTrue || hasFalse) dom = parseOneLineConditionals(dom, model)
-    if (hasInclude) dom = parseIncludes(dom, model)
-    if (hasLoop) dom = parseLoops(dom, model)
-    if (hasInline) dom = parseInlines(dom, model)
-    if (hasSelected) dom = parseSelectedAttributeValues(dom, model)
-    const cachesStillPresent = renderedTemplate.includes('</cache>')
-    renderedTemplate = dom.html()
-    renderedTemplate = parseVars(renderedTemplate, model)
-    if (parseDynamicIncludes) {
-      renderedTemplate = removeTeddyComments(renderedTemplate)
-      parseDynamicIncludes = false
-    }
-    if (renderedTemplate.includes('teddydeferreddynamicinclude="true"')) {
-      oldTemplate = '' // reset old template to force another pass
-      parseDynamicIncludes = true
-    }
-    if (oldTemplate === renderedTemplate && cachesStillPresent) {
-      dom = cheerioLoad(renderedTemplate || '', cheerioOptions)
-      dom = defineNewCaches(dom, model)
-      renderedTemplate = dom.html()
-    }
-  } while (oldTemplate !== renderedTemplate)
-
-  // remove stray teddy tags if any exist
-  if (renderedTemplate.includes('teddydeferredonelineconditional="true"') || renderedTemplate.includes('</include>') || renderedTemplate.includes('</arg>') || renderedTemplate.includes('</if>') || renderedTemplate.includes('</unless>') || renderedTemplate.includes('</elseif>') || renderedTemplate.includes('</elseunless>') || renderedTemplate.includes('</else>') || renderedTemplate.includes('</loop>') || renderedTemplate.includes('</cache>') || renderedTemplate.includes('</pre>')) {
-    dom = cheerioLoad(renderedTemplate || '', cheerioOptions)
-    dom = cleanupStrayTeddyTags(dom)
-    renderedTemplate = dom.html()
+  // everything about a template that does not depend on the model is done once and kept together against the argument the caller passed, whether that was a name or the markup itself
+  //
+  // the entry is looked for before anything else happens, because reading the template and stripping its comments are template level work too
+  let prepared = compiledCache.get(template)
+  // a name may point at different markup than it did last time, so an entry keyed by one is only trusted on the same terms as the template source itself. an entry keyed by markup cannot go stale, because the key is the content
+  if (prepared && !prepared.keyIsMarkup && !params.cacheTemplates) prepared = undefined
+  if (!prepared) {
+    let source = loadTemplate(template)
+    // a name that resolves to nothing falls back to being rendered as though it were markup
+    if (source === null) source = template.slice(-5) === '.html' ? template.substring(0, template.length - 5) : template
+    prepared = prepareTemplate(template, source, template.includes('<'))
   }
+  renderedTemplate = prepared.markup
+
+  // render from what the compiler worked out about this template: emitted javascript where that was possible, and a walk of the node tree otherwise. neither reparses the markup
+  const state = { values: [] }
+  renderedTemplate = prepared.render ? prepared.render(model, state) : compiler.renderNodes(prepared.nodes, model, state)
 
   // replace <noteddy> blocks with the hidden code
   for (const blockId in model._noTeddyBlocks) {
@@ -1418,7 +781,6 @@ export default {
   setDefaultParams,
   setVerbosity,
   setTemplateRoot,
-  setMaxPasses,
   setEmptyVarBehavior,
   setIncludeNotFoundBehavior,
   setCacheTemplates,

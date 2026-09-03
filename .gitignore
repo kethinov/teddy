@@ -1,22 +1,18 @@
-lib-cov
-*.seed
-*.log
-*.csv
-*.dat
-*.out
-*.pid
-*.gz
-
-pids
-logs
-results
-
-npm-debug.log
+# operating system and editor leftovers
 .DS_Store
+Thumbs.db
+*~
+
+*.log
+
 node_modules
-coverage
-dist
-test-results
-test/client.*
 .npm-cache
+
+# build output
+dist
+test/client.*
+
+# test and coverage output
+coverage
 .nyc_output
+test-results
