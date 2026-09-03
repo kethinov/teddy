@@ -1,6 +1,16 @@
 import { execSync } from 'child_process'
 import fs from 'fs'
 
+// every fixture in test/templates, by the name a render would ask for it by
+function testTemplateNames (dir, base = dir, found = []) {
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    const full = dir + '/' + entry.name
+    if (entry.isDirectory()) testTemplateNames(full, base, found)
+    else if (entry.name.endsWith('.html')) found.push(full.slice(base.length + 1, -5))
+  }
+  return found
+}
+
 // these tests are shared by both mocha and playwright
 // to skip test groups or individual tests, add `skip: true` to the group or test object
 // to test an individual group or test, add `only: true` to the group or test object
@@ -17,6 +27,25 @@ export default [
         template: 'conditionals/if',
         run: async (teddy, template, model, assert, expected) => assert(teddy.render(template, model), expected),
         expected: '<p>The variable \'something\' is present</p>'
+      },
+      {
+        // the arms of a chain are siblings in the document, so what sits between them belongs to the page and is written whichever arm applies. the compiler folds that content into every branch, and content it cannot fold keeps the chain in its other form, so both are worth a test
+        message: 'should write markup that sits between the arms of a chain when the opening arm applies (conditionals/ifContentBetweenArms.html)',
+        template: 'conditionals/ifContentBetweenArms',
+        run: async (teddy, template, model, assert, expected) => assert(teddy.render(template, model), expected),
+        expected: '<p>The variable \'something\' is present</p><p>This sits between the arms and belongs to the page</p>'
+      },
+      {
+        message: 'should write markup that sits between the arms of a chain when a later arm applies (conditionals/unlessContentBetweenArms.html)',
+        template: 'conditionals/unlessContentBetweenArms',
+        run: async (teddy, template, model, assert, expected) => assert(teddy.render(template, model), expected),
+        expected: '<p>This sits between the arms and belongs to the page</p><p>The variable \'something\' is present</p>'
+      },
+      {
+        message: 'should resolve a {variable} that sits between the arms of a chain (conditionals/ifVariableBetweenArms.html)',
+        template: 'conditionals/ifVariableBetweenArms',
+        run: async (teddy, template, model, assert, expected) => assert(teddy.render(template, model), expected),
+        expected: '<p>The variable \'something\' is present</p><p>Between the arms: Some content</p>'
       },
       {
         message: 'should evaluate <if doesntexist> as false and trigger <else> condition (conditionals/ifElse.html)',
@@ -624,19 +653,19 @@ export default [
         expected: '<div>Template "noExist.html" not found!<p>Some content</p></div>'
       },
       {
-        message: 'should escape from infinite loop of includes via setMaxPasses (includes/includeInfiniteLoop.html)',
+        // the template includes another whose argument includes the first one back again, so the loop runs through an <arg> rather than being a direct self include
+        message: 'should refuse to compile a template that includes itself, and name the templates leading round the loop (includes/includeInfiniteLoop.html)',
         template: 'includes/includeInfiniteLoop',
         run: async (teddy, template, model, assert, expected) => {
-          teddy.setVerbosity(3)
-          teddy.setMaxPasses(100)
-
+          teddy.setVerbosity(0)
           try {
             teddy.render(template, model)
+            return 'it rendered instead of refusing'
           } catch (e) {
-            return e.message
+            return e.message.includes('includes itself') && e.message.includes('includes/includeInfiniteLoop.html') ? 'refused and named the loop' : e.message
           }
         },
-        expected: 'teddy could not finish rendering the template because the max number of passes over the template (100) was exceeded; there may be an infinite loop in your template logic.'
+        expected: 'refused and named the loop'
       },
       {
         message: 'should evaluate a nested reverse quotes oneliner with an arg passed to it (includes/nestedOneliner.html)',
@@ -705,10 +734,10 @@ export default [
       },
       {
         // an iteration whose body needs no teddy parsing skips being loaded into a dom of its own, so this checks that the markup those iterations produce is still tidied up the way it always was
-        message: 'should tidy up malformed markup coming from the model in a loop (looping/loopWithRawMarkup.html)',
+        message: 'should write malformed markup coming from the model in a loop out verbatim (looping/loopWithRawMarkup.html)',
         template: 'looping/loopWithRawMarkup',
         run: async (teddy, template, model, assert, expected) => assert(teddy.render(template, model), expected),
-        expected: '<div><em>fine</em></div><div><p>unclosed</p></div><div><b><i>crossed</i></b></div>'
+        expected: '<div><em>fine</em></div><div><p>unclosed</div><div><b><i>crossed</b></i></div>'
       },
       {
         message: 'should loop through {objects} correctly (looping/loopArrayOfObjects.html)',
@@ -1111,6 +1140,40 @@ export default [
         template: 'misc/twoClasses',
         run: async (teddy, template, model, assert, expected) => assert(teddy.render(template, model), expected),
         expected: '<p class="one" class-teddyduplicate1="two">2</p>'
+      },
+      {
+        // a whole template cache is keyed on a model value, and that value becomes the name of an entry. a name is always a string, so a key whose value is not one has to be read back as the string it was stored under or the entry is never found again
+        message: 'should find a whole template cache entry again when the key it is stored under is not a string',
+        runMocha: async (teddy, template, model, assert, expected) => {
+          const markup = '<p>{n}</p>'
+          const answers = []
+          for (const keyVal of ['a1', 42, 0, '']) {
+            teddy.clearTemplates()
+            teddy.setCache({ template: markup, key: 'id' })
+            const first = teddy.render(markup, { id: keyVal, n: 'first' })
+            const second = teddy.render(markup, { id: keyVal, n: 'second' })
+            answers.push(second === first ? 'cached' : 'rendered again')
+            teddy.clearCache({ template: markup })
+          }
+          assert(answers.join(', '), 'cached, cached, cached, cached')
+        },
+        expected: 'cached, cached, cached, cached'
+      },
+      {
+        message: 'should still re-render a whole template cache entry once it is older than its max age',
+        runMocha: async (teddy, template, model, assert, expected) => {
+          const markup = '<p>{n}</p>'
+          teddy.clearTemplates()
+          teddy.setCache({ template: markup, key: 'id', maxAge: 60000 })
+          const first = teddy.render(markup, { id: 7, n: 'first' })
+          const fresh = teddy.render(markup, { id: 7, n: 'second' })
+          // reach in and age the entry past its welcome, rather than waiting a minute for it
+          teddy.templateCaches[markup].id.entries['7'].created -= 120000
+          const stale = teddy.render(markup, { id: 7, n: 'third' })
+          teddy.clearCache({ template: markup })
+          assert([fresh === first ? 'served the cache' : 'rendered again', stale === first ? 'served the cache' : 'rendered again'].join(', '), 'served the cache, rendered again')
+        },
+        expected: 'served the cache, rendered again'
       },
       {
         message: 'should cache the contents of the cache element but not anything outside of it (misc/cacheElement.html)',
@@ -1731,13 +1794,14 @@ export default [
         expected: '<p>{undefinedVar}</p><p>{definedParent.undefinedMember}</p>'
       },
       {
+        // the model has foo pointing at bar and bar back at foo. what matters is that the render finishes and writes the unresolvable variable out as it stands; teddy used to answer '{foo}' or '{bar}' depending on how many passes had run before it gave up on the loop
         message: 'should prevent infinitely referencing variables (misc/varRefVar.html)',
         template: 'misc/varRefVar',
         run: async (teddy, template, model, assert, expected) => {
           teddy.setVerbosity(0)
           return teddy.render(template, model)
         },
-        expected: '{foo}'
+        expected: ['{foo}', '{bar}']
       },
       {
         message: 'should render empty strings as is for variables that are empty strings (misc/emptyStringVariable.html)',
@@ -1937,20 +2001,20 @@ export default [
         message: 'should render an include whose src cannot be found as nothing when includeNotFoundBehavior is hide',
         run: async (teddy, template, model, assert, expected) => {
           teddy.setIncludeNotFoundBehavior('hide')
-          const result = teddy.render('<div><include src="thisTemplateDoesNotExist"></include></div>', {})
+          const result = teddy.render('<div><include src="thisTemplateIsHidden"></include></div>', {})
           teddy.setIncludeNotFoundBehavior('display') // put it back, since the other include tests expect the message
           assert(result, expected)
         },
         expected: '<div></div>'
       },
       {
-        message: 'should go back to displaying an error for an include that cannot be found',
+        // each of these two renders a template of its own rather than the same one twice, because what an include that cannot be found writes is settled when the template is compiled: a template already compiled under one setting is not recompiled because the setting changed
+        message: 'should display an error for an include that cannot be found when includeNotFoundBehavior is display',
         run: async (teddy, template, model, assert, expected) => {
-          teddy.setIncludeNotFoundBehavior('hide')
           teddy.setIncludeNotFoundBehavior('display')
-          assert(teddy.render('<div><include src="thisTemplateDoesNotExist"></include></div>', {}), expected)
+          assert(teddy.render('<div><include src="thisTemplateIsShown"></include></div>', {}), expected)
         },
-        expected: '<div>Template "thisTemplateDoesNotExist" not found!</div>'
+        expected: '<div>Template "thisTemplateIsShown" not found!</div>'
       },
       {
         message: 'should list a template registered with setTemplate in getTemplates',
@@ -2035,6 +2099,229 @@ export default [
           fs.rmSync('test/client.js')
         },
         expected: ''
+      }
+    ]
+  },
+  {
+    describe: 'Compiler',
+    tests: [
+      {
+        message: 'should compile a model value that is itself a template, such as an i18n string with a placeholder in it',
+        run: async (teddy, template, model, assert, expected) => assert(teddy.render('<p>{greeting}</p>', { greeting: 'Hello {name}', name: 'Ada' }), expected),
+        expected: '<p>Hello Ada</p>'
+      },
+      {
+        message: 'should compile a model value holding teddy markup supplied through a |s variable',
+        run: async (teddy, template, model, assert, expected) => assert(teddy.render('<div>{snippet|s}</div>', { snippet: '<if x>yes</if><else>no</else>' }), expected),
+        expected: '<div>no</div>'
+      },
+      {
+        message: 'should compile a model value holding a teddy loop supplied through a |s variable',
+        run: async (teddy, template, model, assert, expected) => assert(teddy.render('<div>{snippet|s}</div>', { letters: ['a', 'b'], snippet: "<loop through='letters' val='letter'>[{letter}]</loop>" }), expected),
+        expected: '<div>[a][b]</div>'
+      },
+      {
+        message: 'should leave out markup from the model that does not open and close its own tags',
+        run: async (teddy, template, model, assert, expected) => assert(teddy.render('<div>A{half|s}B</div>', { half: '<if something>' }), expected),
+        expected: '<div>AB</div>'
+      },
+      {
+        message: 'should resolve a variable whose name is built from another variable and which also carries a flag (issue: the value used to be written twice)',
+        run: async (teddy, template, model, assert, expected) => assert(teddy.render('<p>{a{b}|s}</p>', { b: 'X', aX: '<em>hi</em>' }), expected),
+        expected: '<p><em>hi</em></p>'
+      },
+      {
+        message: 'should resolve a variable whose name is built from another variable to nothing when the name it spells is not in the model',
+        run: async (teddy, template, model, assert, expected) => assert(teddy.render('<p>{a{b}}</p>', { b: 'X' }), expected),
+        expected: '<p>{aX}</p>'
+      },
+      {
+        message: 'should render a one line if carrying more than four conditions on one element',
+        run: async (teddy, template, model, assert, expected) => assert(teddy.render("<p if-a true='data-a=\"1\"' if-b true='data-b=\"1\"' if-c true='data-c=\"1\"' if-d true='data-d=\"1\"' if-e true='data-e=\"1\"'>hi</p>", { a: true, b: false, c: true, d: false, e: true }), expected),
+        expected: '<p data-a="1" data-c="1" data-e="1">hi</p>'
+      },
+      {
+        message: 'should apply a checked-value whose value comes from the model',
+        run: async (teddy, template, model, assert, expected) => assert(teddy.render("<div checked-value='{pick}'><input type='checkbox' value='a'><input type='checkbox' value='b'></div>", { pick: 'b' }), expected),
+        expected: '<div><input type="checkbox" value="a"><input type="checkbox" value="b" checked="checked"></div>'
+      },
+      {
+        message: 'should apply a selected-value to options generated by a loop',
+        run: async (teddy, template, model, assert, expected) => assert(teddy.render("<select selected-value='b'><loop through='letters' val='letter'><option value='{letter}'>{letter}</option></loop></select>", { letters: ['a', 'b'] }), expected),
+        expected: '<select><option value="a">a</option><option value="b" selected="selected">b</option></select>'
+      },
+      {
+        message: 'should compile a template that contains the control character the compiler uses to mark its own placeholders',
+        run: async (teddy, template, model, assert, expected) => assert(teddy.render('<p>a' + String.fromCharCode(1) + '{x}' + String.fromCharCode(1) + 'b</p>', { x: 'X' }), expected),
+        expected: '<p>a' + String.fromCharCode(1) + 'X' + String.fromCharCode(1) + 'b</p>'
+      },
+      {
+        message: 'should render an <inline> element that names neither css nor js as nothing',
+        run: async (teddy, template, model, assert, expected) => assert(teddy.render('<div><inline></inline></div>', {}), expected),
+        expected: '<div></div>'
+      },
+      {
+        message: 'should render an <include> whose src is a variable and which is passed an argument',
+        run: async (teddy, template, model, assert, expected) => {
+          teddy.setTemplate('compilerDynamicPartial', '<p>{label}</p>')
+          return assert(teddy.render("<include src='{which}'><arg label>from an arg</arg></include>", { which: 'compilerDynamicPartial' }), expected)
+        },
+        expected: '<p>from an arg</p>'
+      },
+      {
+        message: 'should write out a value that refers back to itself rather than resolving forever, and say which values led round the loop',
+        runMocha: async (teddy, template, model, assert, expected) => {
+          const said = []
+          const error = console.error
+          console.error = message => said.push(message)
+          teddy.setVerbosity(1)
+          let rendered
+          try {
+            rendered = teddy.render('<p>{foo}</p>', { foo: '{bar}', bar: '{foo}' })
+          } finally {
+            console.error = error
+            teddy.setVerbosity(0)
+          }
+          assert(rendered === '<p>{bar}</p>' && said.length === 1 && said[0].includes('refers back to itself') && said[0].includes('"{bar}" -> "{foo}" -> "{bar}"'))
+        },
+        expected: true
+      },
+      {
+        message: 'should say so when a template closes a tag it never opened',
+        runMocha: async (teddy, template, model, assert, expected) => {
+          const said = []
+          const warn = console.warn
+          console.warn = message => said.push(message)
+          teddy.setVerbosity(1)
+          try {
+            teddy.clearTemplates()
+            teddy.render('<div>hello</div></div>', {})
+          } finally {
+            console.warn = warn
+            teddy.setVerbosity(0)
+          }
+          assert(said.some(message => message.includes('closes a <div> it never opened')))
+        },
+        expected: true
+      },
+      {
+        message: 'should say so when a variable is given markup that does not open and close its own tags',
+        runMocha: async (teddy, template, model, assert, expected) => {
+          const said = []
+          const warn = console.warn
+          console.warn = message => said.push(message)
+          teddy.setVerbosity(1)
+          try {
+            teddy.render('<div>{half|s}</div>', { half: '<if something>' })
+          } finally {
+            console.warn = warn
+            teddy.setVerbosity(0)
+          }
+          assert(said.some(message => message.includes('not complete on its own')))
+        },
+        expected: true
+      },
+      {
+        message: 'should say so when an outcome attribute has no if- condition to go with it',
+        runMocha: async (teddy, template, model, assert, expected) => {
+          const said = []
+          const warn = console.warn
+          console.warn = message => said.push(message)
+          teddy.setVerbosity(1)
+          let rendered
+          try {
+            teddy.clearTemplates()
+            rendered = teddy.render('<p true=\'class="orphan"\'>hi</p>', {})
+          } finally {
+            console.warn = warn
+            teddy.setVerbosity(0)
+          }
+          assert(rendered === '<p>hi</p>' && said.some(message => message.includes('with no if- condition')))
+        },
+        expected: true
+      },
+      {
+        message: 'should say so when an <arg> has no <include> around it',
+        runMocha: async (teddy, template, model, assert, expected) => {
+          const said = []
+          const warn = console.warn
+          console.warn = message => said.push(message)
+          teddy.setVerbosity(1)
+          let rendered
+          try {
+            teddy.clearTemplates()
+            rendered = teddy.render('<div><arg orphan>gone</arg></div>', {})
+          } finally {
+            console.warn = warn
+            teddy.setVerbosity(0)
+          }
+          assert(rendered === '<div></div>' && said.some(message => message.includes('has no <include> around it')))
+        },
+        expected: true
+      },
+      {
+        // this is how a layout works: the page is handed to it as an argument and written out with |s. the rendered page holds teddy's own markers for the blocks it lifted out of parsing, and those markers must not be mistaken for blocks of their own on the way through
+        message: 'should keep a non-parsed block intact when the markup holding it is passed on through another variable',
+        run: async (teddy, template, model, assert, expected) => {
+          teddy.setTemplate('compilerLayout', '<body>{pageContent|s}</body>')
+          return assert(teddy.render("<include src='compilerLayout'><arg pageContent><pre><code>{notAVariable}</code></pre></arg></include>", {}), expected)
+        },
+        expected: '<body><pre><code>{notAVariable}</code></pre></body>'
+      },
+      {
+        message: 'should keep a <noteddy> block intact when the markup holding it is passed on through another variable',
+        run: async (teddy, template, model, assert, expected) => {
+          teddy.setTemplate('compilerLayout2', '<body>{pageContent|s}</body>')
+          return assert(teddy.render("<include src='compilerLayout2'><arg pageContent><p><noteddy>{notAVariable}</noteddy></p></arg></include>", {}), expected)
+        },
+        expected: '<body><p>{notAVariable}</p></body>'
+      },
+      {
+        message: 'should say so when a selected-value cannot reach the elements it would mark',
+        runMocha: async (teddy, template, model, assert, expected) => {
+          const said = []
+          const warn = console.warn
+          console.warn = message => said.push(message)
+          teddy.setVerbosity(1)
+          try {
+            teddy.clearTemplates()
+            teddy.setTemplate('compilerOptionsPartial', '<option value="b">b</option>')
+            teddy.render("<select selected-value='b'><include src='{which}'></include></select>", { which: 'compilerOptionsPartial' })
+          } finally {
+            console.warn = warn
+            teddy.setVerbosity(0)
+          }
+          assert(said.some(message => message.includes('could not be applied')))
+        },
+        expected: true
+      },
+      {
+        // a template the emitter cannot write javascript for still renders, by walking the node tree, and renders the same markup. that makes a mistake in the emitter invisible to every other test here and to compareBuilds.js as well: the output stays right and only the speed goes. this is the one thing that notices
+        //
+        // it has no runPlaywright counterpart on purpose: browser builds do not carry the emitter at all, so there is nothing there to fall back from
+        message: 'should emit javascript for every template in the test suite rather than falling back to walking it',
+        runMocha: async (teddy, template, model, assert, expected) => {
+          const refused = []
+          const warn = console.warn
+          console.warn = message => {
+            if (typeof message === 'string' && message.includes('could not emit javascript')) refused.push(message)
+          }
+          teddy.setVerbosity(2)
+          try {
+            for (const name of testTemplateNames('test/templates')) {
+              try {
+                teddy.render(name, model)
+              } catch (err) {
+                // a template that is meant to throw is not what this is asking about
+              }
+            }
+          } finally {
+            console.warn = warn
+            teddy.setVerbosity(0)
+          }
+          assert(refused.length ? refused.join(' | ') : 'none', 'none')
+        },
+        expected: 'none'
       }
     ]
   }
