@@ -286,8 +286,8 @@ function armTest (branch, id, index, state) {
     return { setup, test: `${inverted ? '!' : ''}r.present(${values[0]})` }
   }
 
-  // the values above are every lookup the arm makes, so the one thing left that a model could be wanted for is a {variable} standing in for a condition's value, which only the opening arm of a chain resolves
-  const wantsModel = index === 0 && arm.attribs.some(([, value]) => value && value.startsWith('{'))
+  // the values above are every lookup the arm makes, so the one thing left that a model could be wanted for is a {variable} standing in for a condition's value, which only the opening arm of a chain resolves. the variable may sit anywhere in the value, so what counts as one has to be decided the same way conditionArgs decides it, or the model it needs will not have been passed
+  const wantsModel = index === 0 && arm.attribs.some(([, value]) => value && value.includes('{'))
   return { setup, test: `r.arm(r.branches[${id}].arms[${index}], ${wantsModel ? state.model : 'null'}, ${index === 0}, [${values.join(', ')}])` }
 }
 
@@ -435,9 +435,9 @@ function emitLoop (node, state, out) {
   const keyName = JSON.stringify(node.keyName ?? null)
   const valName = JSON.stringify(node.valName ?? null)
 
-  // a through naming a {variable} is not known until there is a model to read it from, so that one goes through the helper; anything else is a path this code can read directly, which matters for a loop nested inside another whose collection is the outer loop's val
+  // a through naming a {variable} anywhere in its path is not known until there is a model to read it from, so that one goes through the helper; anything else is a path this code can read directly, which matters for a loop nested inside another whose collection is the outer loop's val
   let js = ''
-  if (node.through && node.through.startsWith('{')) {
+  if (node.through && node.through.includes('{')) {
     js += `const ${collection} = r.collection(${JSON.stringify(node.through)}, ${keyName}, ${valName}, ${state.model})\n`
   } else {
     const source = access(node.through, state)

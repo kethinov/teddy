@@ -365,6 +365,19 @@ export default [
         expected: '<p class="some-class">Some content</p>'
       },
       {
+        // a condition's value may name a {variable} anywhere in it rather than only at its head, and either way the value is not known until there is a model to read it from
+        message: 'should evaluate <if something=\'Some {contentWord}\'> as true, with the variable in the middle of the value (conditionals/conditionalValueVarInMiddle.html)',
+        template: 'conditionals/conditionalValueVarInMiddle',
+        run: async (teddy, template, model, assert, expected) => assert(teddy.render(template, model), expected),
+        expected: '<p>true</p>'
+      },
+      {
+        message: 'should evaluate one line if "if-something" whose value names a {variable} in the middle (conditionals/oneLineValueVarInMiddle.html)',
+        template: 'conditionals/oneLineValueVarInMiddle',
+        run: async (teddy, template, model, assert, expected) => assert(teddy.render(template, model), expected),
+        expected: '<p class="matched">Some content</p>'
+      },
+      {
         message: 'should evaluate <if something> as true and the nested <if not:somethingElse> as false, triggering the nested <else> condition (conditionals/nestedConditional.html)',
         template: 'conditionals/nestedConditional',
         run: async (teddy, template, model, assert, expected) => assert(teddy.render(template, model), expected),
@@ -792,6 +805,13 @@ export default [
         template: 'looping/varNameViaVarInLoopWithIndependentVarsViaArrayTwice',
         run: async (teddy, template, model, assert, expected) => assert(teddy.render(template, model), expected),
         expected: '<p>guy</p><p>girl</p><p>landscape</p><p>man</p><p>woman</p><p>scenary</p>'
+      },
+      {
+        // a through whose middle segment is a {variable} from the enclosing loop is only known once there is a model to read it from, so the loop must resolve the variable before it looks up the path
+        message: 'should render the body of a nested loop whose through names a {variable} from the enclosing loop in the middle of its path (looping/loopThroughWithVarInPath.html)',
+        template: 'looping/loopThroughWithVarInPath',
+        run: async (teddy, template, model, assert, expected) => assert(teddy.render(template, model), expected),
+        expected: '<p id="first">First</p><span>one</span><span>two</span><p id="second">Second</p><span>three</span>'
       },
       {
         message: 'should not render the loop (looping/commentedLoopInLoop.html)',
